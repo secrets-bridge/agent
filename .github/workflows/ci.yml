@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go mod download
+      - run: go build ./...
+      - run: go vet ./...
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go test -race -count=1 ./...
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest
+
+  tidy:
+    name: tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: |
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error::go.mod or go.sum is not tidy. Run 'go mod tidy' locally and commit the result."
+            exit 1
+          fi
+
+  # The agent MUST NOT carry a DB or Redis driver in its dependency
+  # graph. Importing one would silently violate BRD §15 and §24. This
+  # job greps go.sum for the forbidden module paths and fails the build
+  # if any appear.
+  no-db-or-redis:
+    name: no-db-or-redis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check go.sum for forbidden drivers
+        run: |
+          set -e
+          FORBIDDEN_PATTERNS=(
+            "github.com/jackc/pgx"
+            "github.com/lib/pq"
+            "github.com/go-sql-driver/mysql"
+            "go.mongodb.org/mongo-driver"
+            "github.com/redis/go-redis"
+            "github.com/gomodule/redigo"
+            "github.com/go-redis/redis"
+          )
+          status=0
+          for pat in "${FORBIDDEN_PATTERNS[@]}"; do
+            if grep -q -E "^${pat}" go.sum; then
+              echo "::error file=go.sum::forbidden dependency: ${pat}"
+              echo "agents must not depend on a DB or Redis driver (BRD §15, §24)"
+              status=1
+            fi
+          done
+          exit $status
