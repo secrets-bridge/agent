@@ -82,7 +82,25 @@ func main() {
 	logger.Info("identity loaded", "source", string(src), "agent_id", id.AgentID)
 
 	httpClient := client.New(cfg.CPEndpoint)
-	exec := executor.NoOp{} // Real ProviderExecutor lands in a follow-up.
+
+	// PatchExecutor wires the wrap-fetch client + a provider resolver.
+	// The resolver is intentionally inert here: it returns a "provider
+	// not configured" error so patch jobs FAIL LOUDLY rather than
+	// silently no-op. The concrete vault / awssm resolvers land in a
+	// follow-up so this PR doesn't drag cloud SDKs into the agent
+	// binary footprint until they're actually wired.
+	patch := executor.PatchExecutor{
+		AgentID:         id.AgentID,
+		AgentSecret:     id.AgentSecret,
+		Client:          httpClient,
+		ResolveProvider: executor.NotConfiguredResolver,
+	}
+	exec := executor.Router{
+		ByType: map[string]executor.Executor{
+			"patch": patch,
+		},
+		Default: executor.NoOp{},
+	}
 
 	probes := local.NewProbes()
 	probes.SetReady(true)

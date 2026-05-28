@@ -2,7 +2,10 @@ module github.com/secrets-bridge/agent
 
 go 1.24.3
 
-require github.com/prometheus/client_golang v1.23.2
+require (
+	github.com/prometheus/client_golang v1.23.2
+	github.com/secrets-bridge/core v0.0.0-20260528111629-ef7fd75f9028
+)
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
