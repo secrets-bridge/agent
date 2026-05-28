@@ -48,6 +48,12 @@ type Config struct {
 	ClaimInterval      time.Duration
 	ClaimConcurrency   int
 	ShutdownGrace      time.Duration
+	// ClusterName identifies this agent's boundary (e.g. "prod-eu",
+	// "uat-archive-account"). Required for discover jobs — the agent
+	// stamps every discovered secret with this name so the CP can
+	// disambiguate the same secret_ref across clusters. Optional for
+	// patch/read jobs (they're scoped via target_secret_ref).
+	ClusterName string
 }
 
 // Env var names for credential material.
@@ -94,9 +100,17 @@ func main() {
 		Client:          httpClient,
 		ResolveProvider: executor.ResolverByType(ctx),
 	}
+	discover := executor.DiscoverExecutor{
+		AgentID:         id.AgentID,
+		AgentSecret:     id.AgentSecret,
+		ClusterName:     cfg.ClusterName,
+		Client:          httpClient,
+		ResolveProvider: executor.ResolverByType(ctx),
+	}
 	exec := executor.Router{
 		ByType: map[string]executor.Executor{
-			"patch": patch,
+			"patch":    patch,
+			"discover": discover,
 		},
 		Default: executor.NoOp{},
 	}
