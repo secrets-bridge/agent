@@ -4,6 +4,7 @@ import (
 	"flag"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -18,6 +19,9 @@ func loadConfig() Config {
 		ClaimConcurrency:  envInt("SB_CLAIM_CONCURRENCY", 4),
 		ShutdownGrace:     envDuration("SB_SHUTDOWN_GRACE", 15*time.Second),
 		ClusterName:       envOr("SB_CLUSTER_NAME", ""),
+		InsecureTransport: envBool("SB_INSECURE_TRANSPORT", false),
+		CAFile:            envOr("SB_CP_CA_FILE", ""),
+		TLSServerName:     envOr("SB_CP_TLS_SERVER_NAME", ""),
 	}
 
 	flag.StringVar(&cfg.CPEndpoint, "cp-endpoint", cfg.CPEndpoint,
@@ -37,12 +41,33 @@ func loadConfig() Config {
 		"graceful-shutdown deadline (also SB_SHUTDOWN_GRACE)")
 	flag.StringVar(&cfg.ClusterName, "cluster-name", cfg.ClusterName,
 		"cluster identity stamped on discovered secrets (also SB_CLUSTER_NAME)")
+	flag.BoolVar(&cfg.InsecureTransport, "insecure-transport", cfg.InsecureTransport,
+		"allow plain http:// to the CP (DEV ONLY; also SB_INSECURE_TRANSPORT)")
+	flag.StringVar(&cfg.CAFile, "cp-ca-file", cfg.CAFile,
+		"path to a CA bundle to trust for the CP cert (also SB_CP_CA_FILE)")
+	flag.StringVar(&cfg.TLSServerName, "cp-tls-server-name", cfg.TLSServerName,
+		"override TLS SNI / cert verification hostname (also SB_CP_TLS_SERVER_NAME)")
 	flag.Parse()
 
 	if cfg.CPEndpoint == "" {
 		panic("agent: SB_CP_ENDPOINT (or --cp-endpoint) is required")
 	}
 	return cfg
+}
+
+func envBool(key string, fallback bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func envOr(key, fallback string) string {
