@@ -17,6 +17,7 @@ func loadConfig() Config {
 		ClaimInterval:     envDuration("SB_CLAIM_INTERVAL", 5*time.Second),
 		ClaimConcurrency:  envInt("SB_CLAIM_CONCURRENCY", 4),
 		ShutdownGrace:     envDuration("SB_SHUTDOWN_GRACE", 15*time.Second),
+		ClusterName:       envOr("SB_CLUSTER_NAME", ""),
 	}
 
 	flag.StringVar(&cfg.CPEndpoint, "cp-endpoint", cfg.CPEndpoint,
@@ -34,6 +35,8 @@ func loadConfig() Config {
 		"max in-flight jobs (also SB_CLAIM_CONCURRENCY)")
 	flag.DurationVar(&cfg.ShutdownGrace, "shutdown-grace", cfg.ShutdownGrace,
 		"graceful-shutdown deadline (also SB_SHUTDOWN_GRACE)")
+	flag.StringVar(&cfg.ClusterName, "cluster-name", cfg.ClusterName,
+		"cluster identity stamped on discovered secrets (also SB_CLUSTER_NAME)")
 	flag.Parse()
 
 	if cfg.CPEndpoint == "" {
