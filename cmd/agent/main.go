@@ -107,9 +107,16 @@ func main() {
 		Client:          httpClient,
 		ResolveProvider: executor.ResolverByType(ctx),
 	}
+	read := executor.ReadExecutor{
+		AgentID:         id.AgentID,
+		AgentSecret:     id.AgentSecret,
+		Client:          httpClient,
+		ResolveProvider: executor.ResolverByType(ctx),
+	}
 	exec := executor.Router{
 		ByType: map[string]executor.Executor{
 			"patch":    patch,
+			"read":     read,
 			"discover": discover,
 		},
 		Default: executor.NoOp{},
