@@ -43,7 +43,7 @@ func TestGetWrap_HappyPath_VerifiesContentHash(t *testing.T) {
 		_, _ = w.Write([]byte(body))
 	})
 
-	got, err := c.GetWrap(t.Context(), "agent-x", "s", "w")
+	got, err := c.GetWrap(t.Context(), "agent-x", "s", "w", nil, nil)
 	if err != nil {
 		t.Fatalf("GetWrap: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestGetWrap_ContentHashMismatch(t *testing.T) {
 	c, _ := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(body))
 	})
-	_, err := c.GetWrap(t.Context(), "a", "s", "w")
+	_, err := c.GetWrap(t.Context(), "a", "s", "w", nil, nil)
 	if !errors.Is(err, client.ErrContentHashMismatch) {
 		t.Fatalf("got %v want ErrContentHashMismatch", err)
 	}
@@ -83,7 +83,7 @@ func TestGetWrap_StatusMapping(t *testing.T) {
 			c, _ := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(tc.status)
 			})
-			_, err := c.GetWrap(t.Context(), "a", "s", "w")
+			_, err := c.GetWrap(t.Context(), "a", "s", "w", nil, nil)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("got %v want %v", err, tc.want)
 			}

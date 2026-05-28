@@ -5,6 +5,7 @@ go 1.24.3
 require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/secrets-bridge/core v0.0.0-20260528111629-ef7fd75f9028
+	golang.org/x/crypto v0.45.0
 )
 
 require (
@@ -47,7 +48,6 @@ require (
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/ryanuber/go-glob v1.0.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
-	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect

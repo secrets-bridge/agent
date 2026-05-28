@@ -36,8 +36,14 @@ import (
 
 // WrapClient is the slice of *client.Client the PatchExecutor needs.
 // Defined here as an interface so unit tests can swap in a fake.
+//
+// agentPubKey / agentPrivKey are the agent's static X25519 keypair
+// (wire-envelope, Piece 8b). When the CP returned a sealed response,
+// GetWrap uses the keypair to decrypt. Pass nil for both to keep the
+// legacy plaintext-over-TLS path; the CP MUST NOT have a public key
+// registered for this agent in that mode or GetWrap will fail loud.
 type WrapClient interface {
-	GetWrap(ctx context.Context, agentID, agentSecret, wrapID string) (*client.Wrap, error)
+	GetWrap(ctx context.Context, agentID, agentSecret, wrapID string, agentPubKey, agentPrivKey []byte) (*client.Wrap, error)
 }
 
 // ProviderResolver maps a job's target_provider_type + config into a
@@ -55,10 +61,12 @@ func NotConfiguredResolver(providerType string, _ map[string]any) (providers.Pro
 
 // PatchExecutor implements Executor for job_type=patch jobs.
 type PatchExecutor struct {
-	AgentID      string
-	AgentSecret  string
-	Client       WrapClient
-	ResolveProvider ProviderResolver
+	AgentID          string
+	AgentSecret      string
+	AgentPublicKey   []byte // nil = legacy plaintext-over-TLS path
+	AgentPrivateKey  []byte
+	Client           WrapClient
+	ResolveProvider  ProviderResolver
 }
 
 // Execute runs one patch job to completion.
@@ -83,7 +91,7 @@ func (p PatchExecutor) Execute(ctx context.Context, job *client.Job) client.JobO
 	}()
 
 	for _, w := range payload.Wraps {
-		got, err := p.Client.GetWrap(ctx, p.AgentID, p.AgentSecret, w.WrapID)
+		got, err := p.Client.GetWrap(ctx, p.AgentID, p.AgentSecret, w.WrapID, p.AgentPublicKey, p.AgentPrivateKey)
 		if err != nil {
 			return fail(fmt.Sprintf("fetch wrap %s (%s): %v", w.WrapID, w.KeyName, err))
 		}
