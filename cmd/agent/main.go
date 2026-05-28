@@ -83,17 +83,16 @@ func main() {
 
 	httpClient := client.New(cfg.CPEndpoint)
 
-	// PatchExecutor wires the wrap-fetch client + a provider resolver.
-	// The resolver is intentionally inert here: it returns a "provider
-	// not configured" error so patch jobs FAIL LOUDLY rather than
-	// silently no-op. The concrete vault / awssm resolvers land in a
-	// follow-up so this PR doesn't drag cloud SDKs into the agent
-	// binary footprint until they're actually wired.
+	// PatchExecutor wires the wrap-fetch client + the dispatching
+	// provider resolver. ResolverByType registers each provider kind
+	// that's compiled in (vault today; aws-sm + others land as they're
+	// implemented). Unknown providerType values fall through to
+	// NotConfiguredResolver so the job fails loud.
 	patch := executor.PatchExecutor{
 		AgentID:         id.AgentID,
 		AgentSecret:     id.AgentSecret,
 		Client:          httpClient,
-		ResolveProvider: executor.NotConfiguredResolver,
+		ResolveProvider: executor.ResolverByType(ctx),
 	}
 	exec := executor.Router{
 		ByType: map[string]executor.Executor{
