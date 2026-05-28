@@ -157,7 +157,7 @@ func TestBuildHTTPClient_HitsTLSServerWithPinnedCA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}

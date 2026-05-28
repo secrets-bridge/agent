@@ -36,8 +36,8 @@ func validateEndpoint(endpoint string, insecure bool) (*url.URL, error) {
 	case "http":
 		if !insecure {
 			return nil, errors.New(
-				"SB_CP_ENDPOINT uses plain http:// — refuse to start. " +
-					"Use https:// in production. For dev only, set SB_INSECURE_TRANSPORT=true.")
+				"SB_CP_ENDPOINT uses plain http:// — refuse to start; " +
+					"use https:// in production, or set SB_INSECURE_TRANSPORT=true for dev only")
 		}
 		return u, nil
 	default:
