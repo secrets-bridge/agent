@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -8,8 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 )
+
+// bytesReader is a small alias so PostWrap doesn't need to import
+// bytes at the call site. Returns an io.Reader of the given bytes.
+func bytesReader(b []byte) io.Reader { return bytes.NewReader(b) }
 
 // Wrap is the agent's view of a CP wrap retrieval. Plaintext is the
 // decoded value bytes — the agent MUST NOT log it, MUST zero it after
@@ -123,5 +129,75 @@ func (c *Client) GetWrap(ctx context.Context, agentID, agentSecret, wrapID strin
 func Zero(b []byte) {
 	for i := range b {
 		b[i] = 0
+	}
+}
+
+// PostWrapRequest is the JSON body of POST /api/v1/agents/:id/wraps.
+// Used by the agent's ReadExecutor: after GetValue returns the bundle,
+// the agent splits by key and POSTs one wrap per key here. The CP
+// envelope-encrypts and persists.
+//
+// IMPORTANT: Value is base64-encoded plaintext. It travels over TLS
+// from agent to CP; both ends are authenticated (AgentAuth here). The
+// caller MUST zero its plaintext slice after the call returns.
+type PostWrapRequest struct {
+	RequestID string `json:"request_id"`
+	KeyName   string `json:"key_name"`
+	Value     string `json:"value"` // base64
+}
+
+// PostWrapResponse mirrors the CP's CreateResponse.
+type PostWrapResponse struct {
+	WrapID      string `json:"wrap_id"`
+	RequestID   string `json:"request_id"`
+	KeyName     string `json:"key_name"`
+	ByteLength  int    `json:"byte_length"`
+	ContentHash string `json:"content_hash"`
+	ExpiresAt   string `json:"expires_at"`
+}
+
+// PostWrap encodes the plaintext as base64 and POSTs the wrap to the
+// CP. The plaintext slice is zeroed by the caller — this method does
+// NOT touch it because Go's []byte→string base64 conversion already
+// holds an internal copy by the time encoding runs.
+func (c *Client) PostWrap(ctx context.Context, agentID, agentSecret, requestID, keyName string, plaintext []byte) (*PostWrapResponse, error) {
+	body, err := json.Marshal(PostWrapRequest{
+		RequestID: requestID,
+		KeyName:   keyName,
+		Value:     base64.StdEncoding.EncodeToString(plaintext),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("client: marshal post-wrap: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.base+"/api/v1/agents/"+agentID+"/wraps", bytesReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("client: build post-wrap request: %w", err)
+	}
+	req.Header.Set("X-Agent-Secret", agentSecret)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("client: post-wrap: %w", err)
+	}
+	defer drainAndClose(resp.Body)
+
+	switch resp.StatusCode {
+	case http.StatusCreated, http.StatusOK:
+		var out PostWrapResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return nil, fmt.Errorf("client: decode post-wrap response: %w", err)
+		}
+		return &out, nil
+	case http.StatusUnauthorized:
+		return nil, ErrUnauthorized
+	case http.StatusNotFound:
+		return nil, ErrNotFound
+	case http.StatusConflict:
+		return nil, ErrRequestNotApproved
+	default:
+		return nil, &HTTPError{Status: resp.StatusCode, Body: readSnippet(resp.Body)}
 	}
 }
