@@ -246,16 +246,36 @@ func (c *Client) SetPublicKey(ctx context.Context, agentID, agentSecret string, 
 
 // PostWrapRequest is the JSON body of POST /api/v1/agents/:id/wraps.
 // Used by the agent's ReadExecutor: after GetValue returns the bundle,
-// the agent splits by key and POSTs one wrap per key here. The CP
-// envelope-encrypts and persists.
+// the agent splits by key and POSTs one wrap per key here.
 //
-// IMPORTANT: Value is base64-encoded plaintext. It travels over TLS
-// from agent to CP; both ends are authenticated (AgentAuth here). The
-// caller MUST zero its plaintext slice after the call returns.
+// EXACTLY ONE of Value or Envelope is populated:
+//
+//   - Value: base64 plaintext over TLS. Legacy path; the api repo
+//     accepts it for backwards-compat with agents that pre-date
+//     Piece 8b. TLS is the only thing protecting it in flight.
+//   - Envelope: agent called /agents/:id/dek for a fresh KMS DEK,
+//     AES-256-GCM-encrypted the plaintext locally with that DEK,
+//     and POSTs the ciphertext + nonce + DEK ciphertext. Plaintext
+//     never crosses the wire — defense against TLS-terminating
+//     proxies and accidental CP-side plaintext logging.
+//
+// Caller MUST zero its plaintext slice after the call returns.
 type PostWrapRequest struct {
-	RequestID string `json:"request_id"`
-	KeyName   string `json:"key_name"`
-	Value     string `json:"value"` // base64
+	RequestID string             `json:"request_id"`
+	KeyName   string             `json:"key_name"`
+	Value     string             `json:"value,omitempty"`    // base64; legacy path
+	Envelope  *PostWrapEnvelope  `json:"envelope,omitempty"` // wire-envelope path
+}
+
+// PostWrapEnvelope mirrors api's CreateWrapEnvelope: the agent-side
+// wire-envelope shape posted to the wrap-creation endpoint. All byte
+// fields are base64.
+type PostWrapEnvelope struct {
+	Algorithm     string `json:"algorithm"`      // "aes-256-gcm"
+	Ciphertext    string `json:"ciphertext"`     // AES-GCM(dek, plaintext)
+	Nonce         string `json:"nonce"`          // GCM nonce
+	DEKCiphertext string `json:"dek_ciphertext"` // KMS-wrapped DEK from /dek
+	DEKKMSKeyID   string `json:"dek_kms_key_id,omitempty"`
 }
 
 // DEK is the data key the CP hands the agent for one wire-envelope
@@ -335,16 +355,48 @@ type PostWrapResponse struct {
 	ExpiresAt   string `json:"expires_at"`
 }
 
-// PostWrap encodes the plaintext as base64 and POSTs the wrap to the
-// CP. The plaintext slice is zeroed by the caller — this method does
-// NOT touch it because Go's []byte→string base64 conversion already
-// holds an internal copy by the time encoding runs.
-func (c *Client) PostWrap(ctx context.Context, agentID, agentSecret, requestID, keyName string, plaintext []byte) (*PostWrapResponse, error) {
-	body, err := json.Marshal(PostWrapRequest{
+// PostWrap POSTs a wrap to the CP during the read flow.
+//
+// When useEnvelope is true, the agent calls /agents/:id/dek for a
+// fresh KMS DEK, AES-256-GCM-encrypts the plaintext locally, and
+// sends the ciphertext + nonce + DEK ciphertext. The DEK plaintext
+// is zeroed before the function returns. Plaintext NEVER crosses
+// the wire — defense against TLS-terminating proxies.
+//
+// When useEnvelope is false, the agent base64-encodes the plaintext
+// and sends it over TLS (legacy path; only safe when there is no
+// untrusted proxy between the agent and the CP).
+//
+// The caller's plaintext slice is its responsibility to zero.
+func (c *Client) PostWrap(ctx context.Context, agentID, agentSecret, requestID, keyName string, plaintext []byte, useEnvelope bool) (*PostWrapResponse, error) {
+	reqBody := PostWrapRequest{
 		RequestID: requestID,
 		KeyName:   keyName,
-		Value:     base64.StdEncoding.EncodeToString(plaintext),
-	})
+	}
+	if useEnvelope {
+		dek, err := c.IssueDEK(ctx, agentID, agentSecret)
+		if err != nil {
+			return nil, fmt.Errorf("client: issue dek: %w", err)
+		}
+		// Zero the DEK plaintext as soon as encryption is done — it
+		// must never sit on the heap past this call.
+		ct, nonce, encErr := sealing.EncryptForCP(plaintext, dek.Plaintext)
+		Zero(dek.Plaintext)
+		if encErr != nil {
+			return nil, fmt.Errorf("client: encrypt for cp: %w", encErr)
+		}
+		reqBody.Envelope = &PostWrapEnvelope{
+			Algorithm:     "aes-256-gcm",
+			Ciphertext:    base64.StdEncoding.EncodeToString(ct),
+			Nonce:         base64.StdEncoding.EncodeToString(nonce),
+			DEKCiphertext: base64.StdEncoding.EncodeToString(dek.Ciphertext),
+			DEKKMSKeyID:   dek.KMSKeyID,
+		}
+	} else {
+		reqBody.Value = base64.StdEncoding.EncodeToString(plaintext)
+	}
+
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("client: marshal post-wrap: %w", err)
 	}

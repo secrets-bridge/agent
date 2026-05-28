@@ -169,6 +169,8 @@ func main() {
 	read := executor.ReadExecutor{
 		AgentID:         id.AgentID,
 		AgentSecret:     id.AgentSecret,
+		AgentPublicKey:  kp.Public,
+		AgentPrivateKey: kp.Private,
 		Client:          httpClient,
 		ResolveProvider: executor.ResolverByType(ctx),
 	}

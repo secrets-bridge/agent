@@ -42,14 +42,25 @@ import (
 
 // PostWrapClient is the slice of *client.Client the ReadExecutor
 // needs. Defined here so unit tests can swap in a fake.
+//
+// useEnvelope toggles the wire-envelope path (Piece 8b): true → agent
+// calls /dek and AES-GCM-encrypts locally before POST; false → legacy
+// base64 plaintext over TLS.
 type PostWrapClient interface {
-	PostWrap(ctx context.Context, agentID, agentSecret, requestID, keyName string, plaintext []byte) (*client.PostWrapResponse, error)
+	PostWrap(ctx context.Context, agentID, agentSecret, requestID, keyName string, plaintext []byte, useEnvelope bool) (*client.PostWrapResponse, error)
 }
 
 // ReadExecutor implements Executor for job_type=read jobs.
+//
+// When AgentPublicKey is non-empty the executor sends the wire-envelope
+// shape on PostWrap (Piece 8b). When nil it falls back to the legacy
+// base64-over-TLS path so an agent that pre-dates wire-envelope keeps
+// working unchanged.
 type ReadExecutor struct {
 	AgentID         string
 	AgentSecret     string
+	AgentPublicKey  []byte // nil = legacy plaintext-over-TLS path
+	AgentPrivateKey []byte
 	Client          PostWrapClient
 	ResolveProvider ProviderResolver
 }
@@ -97,6 +108,7 @@ func (r ReadExecutor) Execute(ctx context.Context, job *client.Job) client.JobOu
 		}
 	}
 
+	useEnvelope := len(r.AgentPublicKey) > 0 && len(r.AgentPrivateKey) > 0
 	posted := 0
 	missing := []string{}
 	for _, key := range wantKeys {
@@ -107,7 +119,7 @@ func (r ReadExecutor) Execute(ctx context.Context, job *client.Job) client.JobOu
 		}
 		plain := bytesFromBundleValue(raw)
 		_, err := r.Client.PostWrap(ctx, r.AgentID, r.AgentSecret,
-			payload.RequestID, key, plain)
+			payload.RequestID, key, plain, useEnvelope)
 		client.Zero(plain)
 		if err != nil {
 			return fail(fmt.Sprintf("post wrap key=%q (after %d posted, %d missing): %v",
