@@ -54,6 +54,17 @@ type Config struct {
 	// disambiguate the same secret_ref across clusters. Optional for
 	// patch/read jobs (they're scoped via target_secret_ref).
 	ClusterName string
+
+	// Transit-security knobs. Default posture: REQUIRE https://. The
+	// agent refuses to start on http:// unless InsecureTransport is
+	// explicitly true. Production deployments should never set
+	// InsecureTransport; it exists for `docker compose` dev only.
+	//
+	// CAFile + TLSServerName let operators pin the CP's CA / SNI when
+	// the CP serves TLS behind a private CA or a mismatching cert.
+	InsecureTransport bool
+	CAFile            string
+	TLSServerName     string
 }
 
 // Env var names for credential material.
@@ -77,6 +88,19 @@ func main() {
 		"claim_concurrency", cfg.ClaimConcurrency,
 	)
 
+	// Transit-security gate: refuse plain http:// unless explicitly
+	// opted in. Fails fast so a misconfigured deployment never starts
+	// rather than silently leaking plaintext on the wire.
+	endpointURL, err := validateEndpoint(cfg.CPEndpoint, cfg.InsecureTransport)
+	if err != nil {
+		logger.Error("endpoint validation failed", "error", err)
+		os.Exit(1)
+	}
+	if cfg.InsecureTransport {
+		logger.Warn("SB_INSECURE_TRANSPORT=true — plaintext over the wire; do NOT use in production",
+			"endpoint", endpointURL.Redacted())
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -87,7 +111,12 @@ func main() {
 	}
 	logger.Info("identity loaded", "source", string(src), "agent_id", id.AgentID)
 
-	httpClient := client.New(cfg.CPEndpoint)
+	transportClient, err := buildHTTPClient(cfg)
+	if err != nil {
+		logger.Error("transport setup failed", "error", err)
+		os.Exit(1)
+	}
+	httpClient := client.New(cfg.CPEndpoint).WithHTTPClient(transportClient)
 
 	// PatchExecutor wires the wrap-fetch client + the dispatching
 	// provider resolver. ResolverByType registers each provider kind
