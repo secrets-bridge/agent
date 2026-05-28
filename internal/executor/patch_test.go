@@ -22,7 +22,7 @@ type fakeWrapClient struct {
 	calls  []string
 }
 
-func (f *fakeWrapClient) GetWrap(_ context.Context, _, _, wrapID string) (*client.Wrap, error) {
+func (f *fakeWrapClient) GetWrap(_ context.Context, _, _, wrapID string, _, _ []byte) (*client.Wrap, error) {
 	f.calls = append(f.calls, wrapID)
 	if f.err != nil {
 		return nil, f.err

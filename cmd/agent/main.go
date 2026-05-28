@@ -20,6 +20,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -111,12 +112,39 @@ func main() {
 	}
 	logger.Info("identity loaded", "source", string(src), "agent_id", id.AgentID)
 
+	// Load (or generate) the X25519 keypair used for wire-envelope
+	// encryption with the CP (Piece 8b). Private key never leaves
+	// this process; we register the public key after the HTTP client
+	// is wired so the CP can start sealing future responses.
+	kp, err := identity.LoadOrGenerateKeyPair(identity.EnvPrivateKey, identity.EnvPrivateKeyFile)
+	if err != nil {
+		logger.Error("keypair load failed", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("wire-envelope keypair ready",
+		"source", string(kp.Source),
+		"public_key_b64", base64.StdEncoding.EncodeToString(kp.Public))
+	if kp.Source == identity.KeyPairSourceEphemeral {
+		logger.Warn("wire-envelope keypair is EPHEMERAL — set SB_AGENT_PRIVATE_KEY[_FILE] for persistence; sealed wraps unconsumed at restart will be unrecoverable")
+	}
+
 	transportClient, err := buildHTTPClient(cfg)
 	if err != nil {
 		logger.Error("transport setup failed", "error", err)
 		os.Exit(1)
 	}
 	httpClient := client.New(cfg.CPEndpoint).WithHTTPClient(transportClient)
+
+	// Register the public key with the CP so future GetWrap responses
+	// come SEALED. Idempotent — CP no-ops if we already have this key.
+	// Failure here doesn't kill the agent: fall back to the legacy
+	// plaintext-over-TLS path so the daemon stays useful.
+	if err := httpClient.SetPublicKey(ctx, id.AgentID, id.AgentSecret, kp.Public, "x25519"); err != nil {
+		logger.Warn("public-key registration failed — falling back to plaintext-over-TLS",
+			"error", err)
+	} else {
+		logger.Info("public key registered with CP — sealed wire-envelope active")
+	}
 
 	// PatchExecutor wires the wrap-fetch client + the dispatching
 	// provider resolver. ResolverByType registers each provider kind
@@ -126,6 +154,8 @@ func main() {
 	patch := executor.PatchExecutor{
 		AgentID:         id.AgentID,
 		AgentSecret:     id.AgentSecret,
+		AgentPublicKey:  kp.Public,
+		AgentPrivateKey: kp.Private,
 		Client:          httpClient,
 		ResolveProvider: executor.ResolverByType(ctx),
 	}
@@ -139,6 +169,8 @@ func main() {
 	read := executor.ReadExecutor{
 		AgentID:         id.AgentID,
 		AgentSecret:     id.AgentSecret,
+		AgentPublicKey:  kp.Public,
+		AgentPrivateKey: kp.Private,
 		Client:          httpClient,
 		ResolveProvider: executor.ResolverByType(ctx),
 	}

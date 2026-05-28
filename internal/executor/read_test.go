@@ -21,18 +21,20 @@ type fakePostWrapClient struct {
 }
 
 type postWrapCall struct {
-	requestID string
-	keyName   string
-	plaintext string
+	requestID   string
+	keyName     string
+	plaintext   string
+	useEnvelope bool
 }
 
-func (f *fakePostWrapClient) PostWrap(_ context.Context, _, _, requestID, keyName string, plaintext []byte) (*client.PostWrapResponse, error) {
+func (f *fakePostWrapClient) PostWrap(_ context.Context, _, _, requestID, keyName string, plaintext []byte, useEnvelope bool) (*client.PostWrapResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, postWrapCall{
-		requestID: requestID,
-		keyName:   keyName,
-		plaintext: string(plaintext),
+		requestID:   requestID,
+		keyName:     keyName,
+		plaintext:   string(plaintext),
+		useEnvelope: useEnvelope,
 	})
 	if f.err != nil {
 		return nil, f.err
@@ -313,6 +315,56 @@ func TestReadExecutor_PayloadValidation(t *testing.T) {
 	}
 }
 
+func TestReadExecutor_KeypairTogglesEnvelopePath(t *testing.T) {
+	// When AgentPublicKey + AgentPrivateKey are both set, PostWrap is
+	// called with useEnvelope=true. When nil, useEnvelope=false. This is
+	// the agent-side toggle for Piece 8b wire-envelope encryption.
+	provider := &fakeGetProvider{bytes: []byte(`{"K":"v"}`)}
+
+	t.Run("with keypair → envelope path", func(t *testing.T) {
+		wc := &fakePostWrapClient{}
+		exec := executor.ReadExecutor{
+			AgentID: "a", AgentSecret: "s",
+			AgentPublicKey:  make([]byte, 32),
+			AgentPrivateKey: make([]byte, 32),
+			Client:          wc,
+			ResolveProvider: readResolverReturning(provider),
+		}
+		out := exec.Execute(t.Context(), &client.Job{Payload: map[string]any{
+			"request_id":           "req",
+			"target_provider_type": "vault",
+			"target_secret_ref":    "x",
+		}})
+		if out.Status != client.StatusSucceeded {
+			t.Fatalf("status=%q error=%q", out.Status, out.Error)
+		}
+		if len(wc.calls) != 1 || !wc.calls[0].useEnvelope {
+			t.Fatalf("calls=%+v want useEnvelope=true on single call", wc.calls)
+		}
+	})
+
+	t.Run("without keypair → legacy path", func(t *testing.T) {
+		wc := &fakePostWrapClient{}
+		exec := executor.ReadExecutor{
+			AgentID: "a", AgentSecret: "s",
+			// AgentPublicKey + AgentPrivateKey deliberately nil
+			Client:          wc,
+			ResolveProvider: readResolverReturning(provider),
+		}
+		out := exec.Execute(t.Context(), &client.Job{Payload: map[string]any{
+			"request_id":           "req",
+			"target_provider_type": "vault",
+			"target_secret_ref":    "x",
+		}})
+		if out.Status != client.StatusSucceeded {
+			t.Fatalf("status=%q error=%q", out.Status, out.Error)
+		}
+		if len(wc.calls) != 1 || wc.calls[0].useEnvelope {
+			t.Fatalf("calls=%+v want useEnvelope=false on single call", wc.calls)
+		}
+	})
+}
+
 func TestRouter_DispatchesRead(t *testing.T) {
 	called := false
 	r := executor.Router{
@@ -340,7 +392,7 @@ type countingFailingClient struct {
 	count      int
 }
 
-func (c *countingFailingClient) PostWrap(context.Context, string, string, string, string, []byte) (*client.PostWrapResponse, error) {
+func (c *countingFailingClient) PostWrap(context.Context, string, string, string, string, []byte, bool) (*client.PostWrapResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.count++
