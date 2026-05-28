@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -13,6 +14,8 @@ func loadConfig() Config {
 		IdentityFile:      envOr("SB_IDENTITY_FILE", "/etc/secrets-bridge/identity.json"),
 		LocalAddr:         envOr("SB_LOCAL_ADDR", "127.0.0.1:8090"),
 		HeartbeatInterval: envDuration("SB_HEARTBEAT_INTERVAL", 30*time.Second),
+		ClaimInterval:     envDuration("SB_CLAIM_INTERVAL", 5*time.Second),
+		ClaimConcurrency:  envInt("SB_CLAIM_CONCURRENCY", 4),
 		ShutdownGrace:     envDuration("SB_SHUTDOWN_GRACE", 15*time.Second),
 	}
 
@@ -25,6 +28,10 @@ func loadConfig() Config {
 		"address for /healthz /readyz /metrics; loopback by default (also SB_LOCAL_ADDR)")
 	flag.DurationVar(&cfg.HeartbeatInterval, "heartbeat-interval", cfg.HeartbeatInterval,
 		"time between heartbeats (also SB_HEARTBEAT_INTERVAL)")
+	flag.DurationVar(&cfg.ClaimInterval, "claim-interval", cfg.ClaimInterval,
+		"time between job claim polls (also SB_CLAIM_INTERVAL)")
+	flag.IntVar(&cfg.ClaimConcurrency, "claim-concurrency", cfg.ClaimConcurrency,
+		"max in-flight jobs (also SB_CLAIM_CONCURRENCY)")
 	flag.DurationVar(&cfg.ShutdownGrace, "shutdown-grace", cfg.ShutdownGrace,
 		"graceful-shutdown deadline (also SB_SHUTDOWN_GRACE)")
 	flag.Parse()
@@ -40,6 +47,18 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {

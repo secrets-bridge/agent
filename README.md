@@ -6,8 +6,8 @@
 
 | Issue | Step | Status |
 |---|---|---|
-| [#1](https://github.com/secrets-bridge/agent/issues/1) | Outbound client: identity + heartbeat | **this PR** |
-| [#2](https://github.com/secrets-bridge/agent/issues/2) | Job claim/complete loop | open |
+| [#1](https://github.com/secrets-bridge/agent/issues/1) | Outbound client: identity + heartbeat | ✅ merged |
+| [#2](https://github.com/secrets-bridge/agent/issues/2) | Job claim/complete loop | **this PR** |
 
 ## Hard rules
 
@@ -38,6 +38,8 @@ The agent reads its credential pair from **either** env vars **or** a mounted fi
 | `SB_IDENTITY_FILE` | `--identity-file` | `/etc/secrets-bridge/identity.json` | JSON `{agent_id, agent_secret}` — file bootstrap |
 | `SB_LOCAL_ADDR` | `--local-addr` | `127.0.0.1:8090` | `/healthz` `/readyz` `/metrics` |
 | `SB_HEARTBEAT_INTERVAL` | `--heartbeat-interval` | `30s` | |
+| `SB_CLAIM_INTERVAL` | `--claim-interval` | `5s` | Time between job-claim polls |
+| `SB_CLAIM_CONCURRENCY` | `--claim-concurrency` | `4` | Max in-flight jobs at once |
 | `SB_SHUTDOWN_GRACE` | `--shutdown-grace` | `15s` | |
 | `LOG_LEVEL` | — | `info` | `debug`/`info`/`warn`/`error` |
 
