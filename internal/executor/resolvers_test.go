@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/secrets-bridge/agent/internal/executor"
+	"github.com/secrets-bridge/core/providers/awssecretsmanager"
 	"github.com/secrets-bridge/core/providers/vault"
 )
 
@@ -84,6 +85,97 @@ func TestVaultResolver_NoAuthConfigured(t *testing.T) {
 	}
 }
 
+// --- AWS Secrets Manager ----------------------------------------------
+
+func TestAWSResolver_WrongType(t *testing.T) {
+	r := executor.AWSSecretsManagerResolver(t.Context())
+	_, err := r("vault", nil)
+	if err == nil || !strings.Contains(err.Error(), "providerType=") {
+		t.Fatalf("got %v want providerType mismatch error", err)
+	}
+}
+
+func TestAWSResolver_RegionFromEnv(t *testing.T) {
+	t.Setenv(executor.EnvAWSRegion, "us-east-1")
+	r := executor.AWSSecretsManagerResolver(t.Context())
+	if _, err := r(awssecretsmanager.Kind, nil); err != nil {
+		t.Fatalf("AWSResolver: %v", err)
+	}
+}
+
+func TestAWSResolver_RegionFromPayload(t *testing.T) {
+	r := executor.AWSSecretsManagerResolver(t.Context())
+	if _, err := r(awssecretsmanager.Kind, map[string]any{
+		awssecretsmanager.ConfigRegion: "eu-west-1",
+	}); err != nil {
+		t.Fatalf("AWSResolver: %v", err)
+	}
+}
+
+func TestAWSResolver_PayloadOverridesEnv(t *testing.T) {
+	t.Setenv(executor.EnvAWSRegion, "us-east-1")
+	r := executor.AWSSecretsManagerResolver(t.Context())
+	if _, err := r(awssecretsmanager.Kind, map[string]any{
+		awssecretsmanager.ConfigRegion: "eu-west-1",
+	}); err != nil {
+		t.Fatalf("AWSResolver: %v", err)
+	}
+}
+
+func TestAWSResolver_MissingRegion(t *testing.T) {
+	r := executor.AWSSecretsManagerResolver(t.Context())
+	_, err := r(awssecretsmanager.Kind, nil)
+	if err == nil || !strings.Contains(err.Error(), "region not configured") {
+		t.Fatalf("got %v want region-required error", err)
+	}
+}
+
+func TestAWSResolver_CredentialsInPayloadRefused(t *testing.T) {
+	t.Setenv(executor.EnvAWSRegion, "us-east-1")
+	r := executor.AWSSecretsManagerResolver(t.Context())
+	// Try every banned key — each must be refused independently.
+	banned := []string{
+		"awsAccessKeyID",
+		"awsSecretAccessKey",
+		"awsSessionToken",
+		"accessKeyID",
+		"secretAccessKey",
+		"sessionToken",
+		"credentials",
+	}
+	for _, k := range banned {
+		t.Run(k, func(t *testing.T) {
+			_, err := r(awssecretsmanager.Kind, map[string]any{k: "leak-attempt"})
+			if err == nil || !strings.Contains(err.Error(), "MUST NOT be passed via job payload") {
+				t.Fatalf("payload key %q: got %v want refusal", k, err)
+			}
+		})
+	}
+}
+
+func TestAWSResolver_EndpointAndRoleArnPassedThrough(t *testing.T) {
+	// Non-credential keys (endpoint, roleArn) should be accepted in
+	// the payload — useful for LocalStack and per-tenant assume-role.
+	r := executor.AWSSecretsManagerResolver(t.Context())
+	if _, err := r(awssecretsmanager.Kind, map[string]any{
+		awssecretsmanager.ConfigRegion:   "us-east-1",
+		awssecretsmanager.ConfigEndpoint: "http://localhost:4566",
+		awssecretsmanager.ConfigRoleArn:  "arn:aws:iam::123456789012:role/tenant",
+	}); err != nil {
+		t.Fatalf("AWSResolver: %v", err)
+	}
+}
+
+func TestResolverByType_AWSRoutes(t *testing.T) {
+	t.Setenv(executor.EnvAWSRegion, "us-east-1")
+	r := executor.ResolverByType(context.Background())
+	if _, err := r(awssecretsmanager.Kind, nil); err != nil {
+		t.Fatalf("ResolverByType(aws-sm): %v", err)
+	}
+}
+
+// --- shared dispatch tests --------------------------------------------
+
 func TestResolverByType_KnownProviderRoutesToVault(t *testing.T) {
 	t.Setenv(executor.EnvVaultAddr, "http://localhost:8200")
 	t.Setenv(executor.EnvVaultToken, "tok")
@@ -95,7 +187,7 @@ func TestResolverByType_KnownProviderRoutesToVault(t *testing.T) {
 
 func TestResolverByType_UnknownProviderFallsBack(t *testing.T) {
 	r := executor.ResolverByType(context.Background())
-	_, err := r("aws-sm", nil)
+	_, err := r("azure-kv", nil)
 	// Falls through to NotConfiguredResolver which has a distinctive
 	// error message — verify we ended up there.
 	if err == nil || !strings.Contains(err.Error(), "no provider resolver configured") {
