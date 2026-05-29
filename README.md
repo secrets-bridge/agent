@@ -1,3 +1,14 @@
+<p align="center">
+  <a href="https://github.com/secrets-bridge"><img src="https://raw.githubusercontent.com/secrets-bridge/.github/main/profile/logo.svg" alt="Secrets Bridge" width="520" /></a>
+</p>
+
+<p align="center">
+  <b>The brain behind your secrets.</b><br/>
+  Unified secrets control plane for cloud-native teams.<br/>
+  <a href="https://secrets-bridge.io">secrets-bridge.io</a> · <a href="https://github.com/secrets-bridge">all repos</a>
+</p>
+
+---
 # secrets-bridge / agent
 
 **Outbound-only execution agent for [Secrets Bridge](https://github.com/secrets-bridge).** Runs inside a target boundary (Kubernetes cluster, private VPC, customer account) and communicates ONLY outbound to the Control Plane API + the local secrets provider. **No inbound listener on a public network interface.**
