@@ -102,8 +102,8 @@ github.com/rogpeppe/go-internal v1.10.0 h1:TMyTOH3F/DB16zRVcYyreMH6GnZZrwQVAoYjR
 github.com/rogpeppe/go-internal v1.10.0/go.mod h1:UQnix2H7Ngw/k4C5ijL5+65zddjncjaFoBhdsK/akog=
 github.com/ryanuber/go-glob v1.0.0 h1:iQh3xXAumdQ+4Ufa5b25cRpC5TYKlno6hsv6Cb3pkBk=
 github.com/ryanuber/go-glob v1.0.0/go.mod h1:807d1WSdnB0XRJzKNil9Om6lcp/3a0v4qIHxIXzX/Yc=
-github.com/secrets-bridge/core v0.0.0-20260528111629-ef7fd75f9028 h1:Sj83Oz0OFlkDsN4gU/vlu+JgBi4yddCNGkldb+CylCk=
-github.com/secrets-bridge/core v0.0.0-20260528111629-ef7fd75f9028/go.mod h1:Sb+saFVZY4563CkrVwMxoRiOaM6t9Moht3PgdLOsoMg=
+github.com/secrets-bridge/core v0.0.0-20260530164348-d9523ca39e2f h1:91J6J+kJtIZr2WeRNy3JpFwauXTXnlMVNsA825LAffw=
+github.com/secrets-bridge/core v0.0.0-20260530164348-d9523ca39e2f/go.mod h1:Sb+saFVZY4563CkrVwMxoRiOaM6t9Moht3PgdLOsoMg=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=

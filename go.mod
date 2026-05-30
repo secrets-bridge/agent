@@ -4,7 +4,7 @@ go 1.24.3
 
 require (
 	github.com/prometheus/client_golang v1.23.2
-	github.com/secrets-bridge/core v0.0.0-20260528111629-ef7fd75f9028
+	github.com/secrets-bridge/core v0.0.0-20260530164348-d9523ca39e2f
 	golang.org/x/crypto v0.45.0
 )
 

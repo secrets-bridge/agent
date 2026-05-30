@@ -18,6 +18,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -49,6 +50,12 @@ const (
 	EnvAWSRegion   = "SB_AWS_REGION"
 	EnvAWSRoleArn  = "SB_AWS_ROLE_ARN"
 	EnvAWSEndpoint = "SB_AWS_ENDPOINT" // LocalStack / VPC endpoint override
+	// EnvAWSTagFilter is a JSON object of {tag: value} pairs. Every AWS
+	// tag listed MUST be present (with the same value) on a secret for
+	// it to survive ListMetadata filtering. Intended for "this agent is
+	// locked to environment X" — paired with the IAM tag condition on
+	// the read side for defense in depth. Empty/unset = no filter.
+	EnvAWSTagFilter = "SB_AWS_TAG_FILTER"
 )
 
 // VaultResolver implements ProviderResolver for providerType="vault".
@@ -172,6 +179,19 @@ func mergeAWSConfig(payload map[string]any) (providers.Config, error) {
 	setIfEnv(awssecretsmanager.ConfigRegion, EnvAWSRegion)
 	setIfEnv(awssecretsmanager.ConfigRoleArn, EnvAWSRoleArn)
 	setIfEnv(awssecretsmanager.ConfigEndpoint, EnvAWSEndpoint)
+
+	// SB_AWS_TAG_FILTER is JSON-encoded (e.g.
+	// `{"EnvironmentName":"E-Government-Uat"}`). Parse loudly so a typo
+	// in chart values doesn't silently disable the safety net.
+	if raw := os.Getenv(EnvAWSTagFilter); raw != "" {
+		var parsed map[string]string
+		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+			return nil, fmt.Errorf("aws-sm: %s must be a JSON object of {tag: value} pairs: %w", EnvAWSTagFilter, err)
+		}
+		if len(parsed) > 0 {
+			out[awssecretsmanager.ConfigTagFilter] = parsed
+		}
+	}
 
 	for k, v := range payload {
 		// Refuse any obvious credential key. The underlying provider
