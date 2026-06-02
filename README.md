@@ -18,7 +18,16 @@
 | Issue | Step | Status |
 |---|---|---|
 | [#1](https://github.com/secrets-bridge/agent/issues/1) | Outbound client: identity + heartbeat | ✅ merged |
-| [#2](https://github.com/secrets-bridge/agent/issues/2) | Job claim/complete loop | **this PR** |
+| [#2](https://github.com/secrets-bridge/agent/issues/2) | Job claim/complete loop | ✅ merged |
+| [#5](https://github.com/secrets-bridge/agent/pull/5) | `PatchExecutor` + router (Piece 4b) | ✅ merged |
+| [#6](https://github.com/secrets-bridge/agent/pull/6) | Vault resolver + `ResolverByType` (Piece 4c) | ✅ merged |
+| [#7](https://github.com/secrets-bridge/agent/pull/7) | AWS Secrets Manager resolver (Piece 4d) | ✅ merged |
+| [#8](https://github.com/secrets-bridge/agent/pull/8) | `DiscoverExecutor` + native tag preservation (Piece 6b) | ✅ merged |
+| [#9](https://github.com/secrets-bridge/agent/pull/9) | `ReadExecutor` — selective fetch + per-key wrap (Piece 5b) | ✅ merged |
+| [#10](https://github.com/secrets-bridge/agent/pull/10) | Transit security hardening (Piece 7 — TLS validation + CA pinning) | ✅ merged |
+| [#11](https://github.com/secrets-bridge/agent/pull/11) | Wire-envelope encryption (Piece 8b — X25519 + KMS DEK) | ✅ merged |
+
+The agent is now feature-complete for the write + read + discover flows against both Vault and AWS Secrets Manager, with TLS validation + CA pinning + bi-directional wire-envelope crypto on top of TLS. See [`skills/PROGRESS.md`](https://github.com/secrets-bridge/skills/blob/main/PROGRESS.md) for the slice-by-slice log.
 
 ## Hard rules
 
