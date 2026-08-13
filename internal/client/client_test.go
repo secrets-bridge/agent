@@ -50,7 +50,7 @@ func TestHeartbeat_SendsSecretInHeader(t *testing.T) {
 			},
 		},
 	)
-	if err := c.Heartbeat(context.Background(), "agent-1", "sec-xyz"); err != nil {
+	if _, err := c.Heartbeat(context.Background(), "agent-1", "sec-xyz", nil); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 	if gotHeader != "sec-xyz" {
@@ -66,7 +66,7 @@ func TestHeartbeat_401MapsToErrUnauthorized(t *testing.T) {
 			fn:     func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "no", http.StatusUnauthorized) },
 		},
 	)
-	if err := c.Heartbeat(context.Background(), "x", "wrong"); !errors.Is(err, client.ErrUnauthorized) {
+	if _, err := c.Heartbeat(context.Background(), "x", "wrong", nil); !errors.Is(err, client.ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized, got %v", err)
 	}
 }
@@ -79,7 +79,7 @@ func TestHeartbeat_404MapsToErrNotFound(t *testing.T) {
 			fn:     func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "no", http.StatusNotFound) },
 		},
 	)
-	if err := c.Heartbeat(context.Background(), "missing", "tok"); !errors.Is(err, client.ErrNotFound) {
+	if _, err := c.Heartbeat(context.Background(), "missing", "tok", nil); !errors.Is(err, client.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
@@ -95,7 +95,7 @@ func TestHeartbeat_500ReturnsHTTPErrorWithSnippet(t *testing.T) {
 			},
 		},
 	)
-	err := c.Heartbeat(context.Background(), "x", "sec")
+	_, err := c.Heartbeat(context.Background(), "x", "sec", nil)
 	if err == nil {
 		t.Fatal("expected error on 500")
 	}

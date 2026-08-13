@@ -22,6 +22,17 @@ func loadConfig() Config {
 		InsecureTransport: envBool("SB_INSECURE_TRANSPORT", false),
 		CAFile:            envOr("SB_CP_CA_FILE", ""),
 		TLSServerName:     envOr("SB_CP_TLS_SERVER_NAME", ""),
+
+		// Enroll-on-first-boot (agent-1). When no stored credential exists
+		// AND enrollment is enabled with a token, the agent exchanges the
+		// one-time token for a persistent credential and writes it to
+		// IdentityFile. Providing SB_AGENT_ID+SB_AGENT_SECRET or a
+		// populated identity file takes precedence and skips enrollment.
+		EnrollmentEnabled: envBool("SB_ENROLLMENT_ENABLED", true),
+		EnrollmentToken:   envOr("SB_ENROLLMENT_TOKEN", ""),
+		AgentName:         envOr("SB_AGENT_NAME", ""),
+		ProviderType:      envOr("SB_PROVIDER_TYPE", "aws-sm"),
+		Region:            envOr("SB_REGION", ""),
 	}
 
 	flag.StringVar(&cfg.CPEndpoint, "cp-endpoint", cfg.CPEndpoint,
@@ -47,6 +58,16 @@ func loadConfig() Config {
 		"path to a CA bundle to trust for the CP cert (also SB_CP_CA_FILE)")
 	flag.StringVar(&cfg.TLSServerName, "cp-tls-server-name", cfg.TLSServerName,
 		"override TLS SNI / cert verification hostname (also SB_CP_TLS_SERVER_NAME)")
+	flag.BoolVar(&cfg.EnrollmentEnabled, "enrollment-enabled", cfg.EnrollmentEnabled,
+		"allow enroll-on-first-boot when no stored credential exists (also SB_ENROLLMENT_ENABLED)")
+	flag.StringVar(&cfg.EnrollmentToken, "enrollment-token", cfg.EnrollmentToken,
+		"one-time enrollment token; used only on first boot (also SB_ENROLLMENT_TOKEN). REDACTED from logs")
+	flag.StringVar(&cfg.AgentName, "agent-name", cfg.AgentName,
+		"agent name reported at enrollment; defaults to hostname (also SB_AGENT_NAME)")
+	flag.StringVar(&cfg.ProviderType, "provider-type", cfg.ProviderType,
+		"provider type reported at enrollment, e.g. aws-sm/vault (also SB_PROVIDER_TYPE)")
+	flag.StringVar(&cfg.Region, "region", cfg.Region,
+		"region reported at enrollment (also SB_REGION)")
 	flag.Parse()
 
 	if cfg.CPEndpoint == "" {
