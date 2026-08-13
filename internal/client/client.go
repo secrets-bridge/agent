@@ -10,6 +10,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -46,31 +47,71 @@ func (c *Client) WithHTTPClient(hc *http.Client) *Client {
 	return c
 }
 
-// Heartbeat tells the CP this agent is alive. Returns ErrUnauthorized
-// when the identity has been revoked or the secret is rejected.
-func (c *Client) Heartbeat(ctx context.Context, agentID, agentSecret string) error {
+// HeartbeatReport is the OPTIONAL runtime body an agent may send on a
+// heartbeat (api-2). When nil, the agent sends a bodyless heartbeat and the
+// CP replies 204 (the legacy contract, unchanged). When non-nil, the CP
+// records the fields and replies 200 with a HeartbeatResult. It carries NO
+// credential material — the X-Agent-Secret stays in the header.
+type HeartbeatReport struct {
+	Status       string   `json:"status,omitempty"`
+	AgentVersion string   `json:"agent_version,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+// HeartbeatResult is the parsed 200 response for a heartbeat that carried a
+// body. NextHeartbeatSeconds is the CP's suggested cadence (0 when the CP
+// replied 204 or omitted it — the caller then falls back to its configured
+// interval).
+type HeartbeatResult struct {
+	NextHeartbeatSeconds int `json:"next_heartbeat_seconds"`
+}
+
+// Heartbeat tells the CP this agent is alive. Returns ErrUnauthorized when
+// the identity has been revoked or the secret is rejected.
+//
+// report == nil  → bodyless request → 204 → HeartbeatResult{} (Next 0).
+// report != nil  → JSON body        → 200 → parsed HeartbeatResult.
+func (c *Client) Heartbeat(ctx context.Context, agentID, agentSecret string, report *HeartbeatReport) (*HeartbeatResult, error) {
+	var body io.Reader = http.NoBody
+	if report != nil {
+		payload, err := json.Marshal(report)
+		if err != nil {
+			return nil, fmt.Errorf("client: marshal heartbeat body: %w", err)
+		}
+		body = bytes.NewReader(payload)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.base+"/api/v1/agents/"+agentID+"/heartbeat", http.NoBody)
+		c.base+"/api/v1/agents/"+agentID+"/heartbeat", body)
 	if err != nil {
-		return fmt.Errorf("client: build heartbeat request: %w", err)
+		return nil, fmt.Errorf("client: build heartbeat request: %w", err)
 	}
 	req.Header.Set("X-Agent-Secret", agentSecret)
+	if report != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("client: heartbeat: %w", err)
+		return nil, fmt.Errorf("client: heartbeat: %w", err)
 	}
 	defer drainAndClose(resp.Body)
 
 	switch resp.StatusCode {
-	case http.StatusNoContent, http.StatusOK:
-		return nil
+	case http.StatusNoContent:
+		return &HeartbeatResult{}, nil
+	case http.StatusOK:
+		var out HeartbeatResult
+		// A 200 always carries the richer body; a decode failure is
+		// non-fatal — treat it as "no suggested cadence".
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return &out, nil
 	case http.StatusUnauthorized:
-		return ErrUnauthorized
+		return nil, ErrUnauthorized
 	case http.StatusNotFound:
-		return ErrNotFound
+		return nil, ErrNotFound
 	default:
-		return &HTTPError{Status: resp.StatusCode, Body: readSnippet(resp.Body)}
+		return nil, &HTTPError{Status: resp.StatusCode, Body: readSnippet(resp.Body)}
 	}
 }
 

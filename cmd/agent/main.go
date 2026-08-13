@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -42,13 +43,13 @@ var buildVersion = "dev"
 
 // Config carries the agent's runtime configuration.
 type Config struct {
-	CPEndpoint         string
-	IdentityFile       string
-	LocalAddr          string
-	HeartbeatInterval  time.Duration
-	ClaimInterval      time.Duration
-	ClaimConcurrency   int
-	ShutdownGrace      time.Duration
+	CPEndpoint        string
+	IdentityFile      string
+	LocalAddr         string
+	HeartbeatInterval time.Duration
+	ClaimInterval     time.Duration
+	ClaimConcurrency  int
+	ShutdownGrace     time.Duration
 	// ClusterName identifies this agent's boundary (e.g. "prod-eu",
 	// "uat-archive-account"). Required for discover jobs — the agent
 	// stamps every discovered secret with this name so the CP can
@@ -66,6 +67,17 @@ type Config struct {
 	InsecureTransport bool
 	CAFile            string
 	TLSServerName     string
+
+	// Enroll-on-first-boot (agent-1). Enrollment runs ONLY when no stored
+	// credential exists (env vars or a populated IdentityFile) AND
+	// EnrollmentEnabled is true AND EnrollmentToken is non-empty. The
+	// returned agent_token is persisted to IdentityFile so a restart
+	// reuses it and never spends a second token.
+	EnrollmentEnabled bool
+	EnrollmentToken   string
+	AgentName         string
+	ProviderType      string
+	Region            string
 }
 
 // Env var names for credential material.
@@ -105,17 +117,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	id, src, err := identity.Load(envAgentID, envAgentSecret, cfg.IdentityFile)
-	if err != nil {
-		logger.Error("identity load failed", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("identity loaded", "source", string(src), "agent_id", id.AgentID)
-
 	// Load (or generate) the X25519 keypair used for wire-envelope
-	// encryption with the CP (Piece 8b). Private key never leaves
-	// this process; we register the public key after the HTTP client
-	// is wired so the CP can start sealing future responses.
+	// encryption with the CP (Piece 8b). Private key never leaves this
+	// process; the public key is registered after the credential is
+	// resolved so the CP can start sealing future responses.
 	kp, err := identity.LoadOrGenerateKeyPair(identity.EnvPrivateKey, identity.EnvPrivateKeyFile)
 	if err != nil {
 		logger.Error("keypair load failed", "error", err)
@@ -128,12 +133,26 @@ func main() {
 		logger.Warn("wire-envelope keypair is EPHEMERAL — set SB_AGENT_PRIVATE_KEY[_FILE] for persistence; sealed wraps unconsumed at restart will be unrecoverable")
 	}
 
+	// Build the CP client BEFORE resolving the credential — enroll-on-
+	// first-boot needs it to call /agents/enroll.
 	transportClient, err := buildHTTPClient(cfg)
 	if err != nil {
 		logger.Error("transport setup failed", "error", err)
 		os.Exit(1)
 	}
 	httpClient := client.New(cfg.CPEndpoint).WithHTTPClient(transportClient)
+
+	// Resolve the agent credential: use a stored one (env vars or a
+	// populated identity file) if present; otherwise enroll-on-first-boot
+	// with the one-time token and persist the result. Fails closed when
+	// neither is available. The token + returned agent_token are never
+	// logged.
+	id, src, err := resolveIdentity(ctx, &cfg, httpClient, logger)
+	if err != nil {
+		logger.Error("agent credential not available", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("identity ready", "source", string(src), "agent_id", id.AgentID)
 
 	// Register the public key with the CP so future GetWrap responses
 	// come SEALED. Idempotent — CP no-ops if we already have this key.
@@ -208,39 +227,149 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-// heartbeatLoop calls /heartbeat at HeartbeatInterval forever (until
-// ctx is cancelled). Network errors are logged and retried at the next
-// interval; an Unauthorized response is fatal because either the
-// identity was revoked or the credential is wrong — either way the
-// caller must rotate.
+// heartbeatLoop beats the CP at a SERVER-DRIVEN cadence: each heartbeat
+// carries a small runtime body and the CP replies with next_heartbeat_
+// seconds, which sets the next interval. When the CP omits it (or replies
+// 204), the loop falls back to the configured HeartbeatInterval. An
+// Unauthorized response is fatal — the identity was revoked or the
+// credential is wrong, so the loop stops rather than spin.
 func heartbeatLoop(ctx context.Context, logger *slog.Logger, cfg Config, c *client.Client, id identity.Identity) {
-	t := time.NewTicker(cfg.HeartbeatInterval)
-	defer t.Stop()
+	interval := cfg.HeartbeatInterval
+	report := &client.HeartbeatReport{Status: "active", AgentVersion: buildVersion}
 
-	if err := beatOnce(ctx, logger, c, id); errors.Is(err, client.ErrUnauthorized) {
+	// First beat immediately so the CP sees us alive right after startup.
+	if next, err := beatOnce(ctx, logger, c, id, report, cfg.HeartbeatInterval); errors.Is(err, client.ErrUnauthorized) {
 		return
+	} else if next > 0 {
+		interval = next
 	}
+
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			if err := beatOnce(ctx, logger, c, id); errors.Is(err, client.ErrUnauthorized) {
+		case <-timer.C:
+			next, err := beatOnce(ctx, logger, c, id, report, cfg.HeartbeatInterval)
+			if errors.Is(err, client.ErrUnauthorized) {
 				return
 			}
+			if next > 0 {
+				interval = next
+			}
+			timer.Reset(interval)
 		}
 	}
 }
 
-func beatOnce(ctx context.Context, logger *slog.Logger, c *client.Client, id identity.Identity) error {
+// beatOnce sends one heartbeat and returns the server-suggested next
+// interval (0 when absent → caller keeps its current interval). fallback is
+// used only for logging clarity; the caller owns the fallback interval.
+func beatOnce(ctx context.Context, logger *slog.Logger, c *client.Client, id identity.Identity, report *client.HeartbeatReport, fallback time.Duration) (time.Duration, error) {
 	hbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := c.Heartbeat(hbCtx, id.AgentID, id.AgentSecret); err != nil {
+	res, err := c.Heartbeat(hbCtx, id.AgentID, id.AgentSecret, report)
+	if err != nil {
 		logger.Warn("heartbeat failed", "error", err)
-		return err
+		return 0, err
 	}
-	logger.Debug("heartbeat ok")
-	return nil
+	var next time.Duration
+	if res != nil && res.NextHeartbeatSeconds > 0 {
+		next = time.Duration(res.NextHeartbeatSeconds) * time.Second
+	}
+	logger.Debug("heartbeat ok", "next_heartbeat_seconds", nextSeconds(res))
+	return next, nil
+}
+
+func nextSeconds(res *client.HeartbeatResult) int {
+	if res == nil {
+		return 0
+	}
+	return res.NextHeartbeatSeconds
+}
+
+// resolveIdentity returns the agent's credential. Precedence:
+//
+//  1. Stored credential — env vars (SB_AGENT_ID + SB_AGENT_SECRET) or a
+//     populated identity file. Covers the legacy static-secret path AND an
+//     enrolled agent that already persisted its credential (restart reuse).
+//  2. No stored credential + enrollment enabled + a token present → enroll
+//     once, persist the returned credential to the identity file, and seed
+//     the heartbeat/claim intervals from the response.
+//  3. Otherwise → fail closed with a safe error.
+//
+// The enrollment token and the returned agent_token are never logged,
+// printed, or wrapped into an error.
+func resolveIdentity(ctx context.Context, cfg *Config, c *client.Client, logger *slog.Logger) (identity.Identity, identity.Source, error) {
+	id, src, err := identity.LoadStored(envAgentID, envAgentSecret, cfg.IdentityFile)
+	switch {
+	case err == nil:
+		return id, src, nil
+	case !errors.Is(err, identity.ErrNotConfigured):
+		// Partial env config or a corrupt file — a real misconfiguration.
+		return identity.Identity{}, "", err
+	}
+
+	// No stored credential — the enroll-on-first-boot path.
+	if !cfg.EnrollmentEnabled || cfg.EnrollmentToken == "" {
+		return identity.Identity{}, "", errors.New(
+			"agent credential not configured: set SB_AGENT_ID+SB_AGENT_SECRET, mount a " +
+				"populated identity file, or provide SB_ENROLLMENT_TOKEN with SB_ENROLLMENT_ENABLED=true")
+	}
+
+	name := cfg.AgentName
+	if name == "" {
+		if hn, herr := os.Hostname(); herr == nil {
+			name = hn
+		}
+	}
+	logger.Info("no stored credential — enrolling with CP",
+		"agent_name", name, "provider_type", cfg.ProviderType, "cluster_name", cfg.ClusterName)
+
+	res, err := c.Enroll(ctx, client.EnrollRequest{
+		EnrollmentToken: cfg.EnrollmentToken,
+		AgentName:       name,
+		ProviderType:    cfg.ProviderType,
+		ClusterName:     cfg.ClusterName,
+		AgentVersion:    buildVersion,
+		Region:          cfg.Region,
+	})
+	if err != nil {
+		// err carries only a safe reason code — never the token.
+		return identity.Identity{}, "", fmt.Errorf("enrollment failed: %w", err)
+	}
+
+	newID := identity.Identity{AgentID: res.AgentID, AgentSecret: res.AgentToken}
+	if err := identity.Save(cfg.IdentityFile, newID); err != nil {
+		// The token is now consumed but we couldn't persist the result —
+		// surface loudly so the operator fixes the writable path or issues
+		// a fresh token instead of CrashLooping on a spent token.
+		return identity.Identity{}, "", fmt.Errorf(
+			"enrolled but FAILED to persist credential to %q (token is now consumed; "+
+				"use a writable, restart-persistent identity path or issue a fresh token): %w",
+			cfg.IdentityFile, err)
+	}
+	logger.Info("enrolled and persisted credential",
+		"agent_id", res.AgentID,
+		"provider_connection_id", res.ProviderConnectionID,
+		"identity_file", cfg.IdentityFile)
+
+	applyEnrollIntervals(cfg, res)
+	return newID, identity.SourceEnrolled, nil
+}
+
+// applyEnrollIntervals seeds the heartbeat/claim cadence from the enrollment
+// response, but only for a knob the operator did NOT explicitly set via env
+// var (an explicit setting always wins). Heartbeat cadence is further
+// refined per-beat by next_heartbeat_seconds; claim cadence is fixed.
+func applyEnrollIntervals(cfg *Config, res *client.EnrollResult) {
+	if _, set := os.LookupEnv("SB_HEARTBEAT_INTERVAL"); !set && res.HeartbeatIntervalSeconds > 0 {
+		cfg.HeartbeatInterval = time.Duration(res.HeartbeatIntervalSeconds) * time.Second
+	}
+	if _, set := os.LookupEnv("SB_CLAIM_INTERVAL"); !set && res.JobPollIntervalSeconds > 0 {
+		cfg.ClaimInterval = time.Duration(res.JobPollIntervalSeconds) * time.Second
+	}
 }
 
 // claimLoop polls the CP for runnable jobs and dispatches each to a
