@@ -23,9 +23,9 @@
 | [#6](https://github.com/secrets-bridge/agent/pull/6) | Vault resolver + `ResolverByType` (Piece 4c) | ✅ merged |
 | [#7](https://github.com/secrets-bridge/agent/pull/7) | AWS Secrets Manager resolver (Piece 4d) | ✅ merged |
 | [#8](https://github.com/secrets-bridge/agent/pull/8) | `DiscoverExecutor` + native tag preservation (Piece 6b) | ✅ merged |
-| [#9](https://github.com/secrets-bridge/agent/pull/9) | `ReadExecutor` — selective fetch + per-key wrap (Piece 5b) | ✅ merged |
-| [#10](https://github.com/secrets-bridge/agent/pull/10) | Transit security hardening (Piece 7 — TLS validation + CA pinning) | ✅ merged |
-| [#11](https://github.com/secrets-bridge/agent/pull/11) | Wire-envelope encryption (Piece 8b — X25519 + KMS DEK) | ✅ merged |
+| [#9](https://github.com/secrets-bridge/agent/pull/9) | `ReadExecutor`: selective fetch + per-key wrap (Piece 5b) | ✅ merged |
+| [#10](https://github.com/secrets-bridge/agent/pull/10) | Transit security hardening (Piece 7: TLS validation + CA pinning) | ✅ merged |
+| [#11](https://github.com/secrets-bridge/agent/pull/11) | Wire-envelope encryption (Piece 8b: X25519 + KMS DEK) | ✅ merged |
 
 The agent is now feature-complete for the write + read + discover flows against both Vault and AWS Secrets Manager, with TLS validation + CA pinning + bi-directional wire-envelope crypto on top of TLS. See [`skills/PROGRESS.md`](https://github.com/secrets-bridge/skills/blob/main/PROGRESS.md) for the slice-by-slice log.
 
@@ -35,7 +35,7 @@ The agent is now feature-complete for the write + read + discover flows against 
 |---|---|
 | **No Postgres / Redis / any DB driver** | CI job `no-db-or-redis` greps `go.sum` for forbidden module paths and fails the build if any appear |
 | **No inbound public listener** | Local probe + metrics server binds to `127.0.0.1` only (configurable but loopback by default) |
-| **One credential — no on-disk identity state** | Pod restart re-reads the same K8s Secret; no PVC needed |
+| **One credential, no on-disk identity state** | Pod restart re-reads the same K8s Secret; no PVC needed |
 
 ## How it works
 
@@ -57,7 +57,7 @@ Pod restart:    stored credential found → skip enrollment, heartbeat directly
 admin → CP:    POST /api/v1/agents       → { id, agent_secret }   (break-glass; see api docs)
 admin → K8s:   creates Secret with both fields
 Pod start:     reads Secret (env vars OR file) → heartbeats forever
-Pod restart:   same — reads the same Secret
+Pod restart:   same, reads the same Secret
 ```
 
 **Credential resolution (precedence):** stored env vars (`SB_AGENT_ID`+`SB_AGENT_SECRET`) → populated identity file → enroll-on-first-boot (if enabled + token) → else **fail closed** (`agent credential not configured`). The enrollment token and the returned `agent_token` are never logged.
@@ -69,15 +69,15 @@ The agent reads its credential pair from **either** env vars **or** a mounted fi
 | Env var | Flag | Default | Notes |
 |---|---|---|---|
 | `SB_CP_ENDPOINT` | `--cp-endpoint` | (required) | Control Plane API base URL |
-| `SB_AGENT_ID` | — | (unset) | Agent UUID — env-var bootstrap |
-| `SB_AGENT_SECRET` | — | (unset) | Agent long-lived secret — env-var bootstrap |
-| `SB_IDENTITY_FILE` | `--identity-file` | `/etc/secrets-bridge/identity.json` | JSON `{agent_id, agent_secret}` — file bootstrap |
+| `SB_AGENT_ID` | n/a | (unset) | Agent UUID (env-var bootstrap) |
+| `SB_AGENT_SECRET` | n/a | (unset) | Agent long-lived secret (env-var bootstrap) |
+| `SB_IDENTITY_FILE` | `--identity-file` | `/etc/secrets-bridge/identity.json` | JSON `{agent_id, agent_secret}` (file bootstrap) |
 | `SB_LOCAL_ADDR` | `--local-addr` | `127.0.0.1:8090` | `/healthz` `/readyz` `/metrics` |
 | `SB_HEARTBEAT_INTERVAL` | `--heartbeat-interval` | `30s` | |
 | `SB_CLAIM_INTERVAL` | `--claim-interval` | `5s` | Time between job-claim polls |
 | `SB_CLAIM_CONCURRENCY` | `--claim-concurrency` | `4` | Max in-flight jobs at once |
 | `SB_SHUTDOWN_GRACE` | `--shutdown-grace` | `15s` | |
-| `LOG_LEVEL` | — | `info` | `debug`/`info`/`warn`/`error` |
+| `LOG_LEVEL` | n/a | `info` | `debug`/`info`/`warn`/`error` |
 | `SB_ENROLLMENT_ENABLED` | `--enrollment-enabled` | `true` | Allow enroll-on-first-boot when no credential is stored |
 | `SB_ENROLLMENT_TOKEN` | `--enrollment-token` | (unset) | One-time enrollment token; used ONLY on first boot. **Redacted from logs** |
 | `SB_AGENT_NAME` | `--agent-name` | hostname | Agent name reported at enrollment |
@@ -85,11 +85,11 @@ The agent reads its credential pair from **either** env vars **or** a mounted fi
 | `SB_CLUSTER_NAME` | `--cluster-name` | (unset) | Cluster identity; also reported at enrollment |
 | `SB_REGION` | `--region` | (unset) | Region reported at enrollment |
 
-**Credential precedence:** `SB_AGENT_ID`+`SB_AGENT_SECRET` (env) → populated `SB_IDENTITY_FILE` → enroll-on-first-boot (`SB_ENROLLMENT_ENABLED=true` + `SB_ENROLLMENT_TOKEN`) → else fail closed. On enrollment the agent persists the returned `{agent_id, agent_token}` to `SB_IDENTITY_FILE`, so **that path must be a writable, restart-persistent volume** (a PVC or writable mount) — not a read-only Secret. The CP's `heartbeat_interval_seconds` / `job_poll_interval_seconds` (enroll response) and per-beat `next_heartbeat_seconds` (heartbeat response) drive the cadence unless the operator sets the intervals explicitly.
+**Credential precedence:** `SB_AGENT_ID`+`SB_AGENT_SECRET` (env) → populated `SB_IDENTITY_FILE` → enroll-on-first-boot (`SB_ENROLLMENT_ENABLED=true` + `SB_ENROLLMENT_TOKEN`) → else fail closed. On enrollment the agent persists the returned `{agent_id, agent_token}` to `SB_IDENTITY_FILE`, so **that path must be a writable, restart-persistent volume** (a PVC or writable mount), not a read-only Secret. The CP's `heartbeat_interval_seconds` / `job_poll_interval_seconds` (enroll response) and per-beat `next_heartbeat_seconds` (heartbeat response) drive the cadence unless the operator sets the intervals explicitly.
 
-## Helm patterns (for `secrets-bridge/charts` — Step 14)
+## Helm patterns (for `secrets-bridge/charts`, Step 14)
 
-### Mode A — env-var (clean, easier for dev)
+### Mode A: env-var (clean, easier for dev)
 
 ```yaml
 env:
@@ -101,7 +101,7 @@ env:
       secretKeyRef: { name: my-agent-secret, key: agent_secret }
 ```
 
-### Mode B — mounted file (K8s docs recommend for credentials)
+### Mode B: mounted file (K8s docs recommend for credentials)
 
 ```yaml
 volumes:
@@ -117,7 +117,7 @@ volumeMounts:
 
 Both modes use the same K8s Secret. **No PVC** is needed in either case.
 
-### Mode C — enroll-on-first-boot (self-enrollment; needs a writable identity volume)
+### Mode C: enroll-on-first-boot (self-enrollment; needs a writable identity volume)
 
 The chart should surface these values (wiring lives in `secrets-bridge/charts`):
 
@@ -140,7 +140,7 @@ credential:
   persistPath: /var/lib/secrets-bridge/identity.json
 ```
 
-The enrollment token is spent exactly once: after a successful enroll the agent writes its persistent credential and, on every subsequent restart, loads that credential and skips enrollment. If the identity path is not writable/persistent the agent would re-enroll on restart and fail on the now-consumed token — so this mode requires a writable, restart-persistent volume (unlike Modes A/B).
+The enrollment token is spent exactly once: after a successful enroll the agent writes its persistent credential and, on every subsequent restart, loads that credential and skips enrollment. If the identity path is not writable/persistent the agent would re-enroll on restart and fail on the now-consumed token, so this mode requires a writable, restart-persistent volume (unlike Modes A/B).
 
 ## Layout
 
