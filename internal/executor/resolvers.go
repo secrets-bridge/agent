@@ -264,7 +264,7 @@ func mergeAWSConfig(payload map[string]any) (providers.Config, error) {
 	setIfEnv(awssecretsmanager.ConfigEndpoint, EnvAWSEndpoint)
 
 	// SB_AWS_TAG_FILTER is JSON-encoded (e.g.
-	// `{"EnvironmentName":"E-Government-Uat"}`). Parse loudly so a typo
+	// `{"EnvironmentName":"tenant-a-uat"}`). Parse loudly so a typo
 	// in chart values doesn't silently disable the safety net.
 	if raw := os.Getenv(EnvAWSTagFilter); raw != "" {
 		var parsed map[string]string
