@@ -13,7 +13,7 @@ import (
 
 func TestMergeAWSConfig_TagFilterFromEnv(t *testing.T) {
 	t.Setenv(EnvAWSRegion, "us-east-1")
-	t.Setenv(EnvAWSTagFilter, `{"EnvironmentName":"E-Government-Uat","Project":"Pension"}`)
+	t.Setenv(EnvAWSTagFilter, `{"EnvironmentName":"tenant-a-uat","Project":"project-alpha"}`)
 
 	cfg, err := mergeAWSConfig(nil)
 	if err != nil {
@@ -27,7 +27,7 @@ func TestMergeAWSConfig_TagFilterFromEnv(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected map[string]string, got %T", raw)
 	}
-	if parsed["EnvironmentName"] != "E-Government-Uat" || parsed["Project"] != "Pension" {
+	if parsed["EnvironmentName"] != "tenant-a-uat" || parsed["Project"] != "project-alpha" {
 		t.Errorf("unexpected tagFilter: %+v", parsed)
 	}
 }
@@ -73,17 +73,17 @@ func TestMergeAWSConfig_PayloadTagFilterOverridesEnv(t *testing.T) {
 	// payload. Payload wins per the documented precedence; the
 	// provider AND's both filters internally.
 	t.Setenv(EnvAWSRegion, "us-east-1")
-	t.Setenv(EnvAWSTagFilter, `{"EnvironmentName":"E-Government-Uat"}`)
+	t.Setenv(EnvAWSTagFilter, `{"EnvironmentName":"tenant-a-uat"}`)
 	cfg, err := mergeAWSConfig(map[string]any{
 		awssecretsmanager.ConfigTagFilter: map[string]any{
-			"Project": "Pension",
+			"Project": "project-alpha",
 		},
 	})
 	if err != nil {
 		t.Fatalf("mergeAWSConfig: %v", err)
 	}
 	got := cfg[awssecretsmanager.ConfigTagFilter]
-	if m, ok := got.(map[string]any); !ok || m["Project"] != "Pension" {
+	if m, ok := got.(map[string]any); !ok || m["Project"] != "project-alpha" {
 		t.Errorf("expected payload to override env, got %T %+v", got, got)
 	}
 }
