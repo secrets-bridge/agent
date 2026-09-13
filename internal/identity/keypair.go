@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -76,6 +77,15 @@ func LoadOrGenerateKeyPair(envKey, envKeyFile string) (*KeyPair, error) {
 	// 2. file path mode
 	if path := os.Getenv(envKeyFile); path != "" {
 		if data, err := os.ReadFile(path); err == nil {
+			// AGT-04: a private key file must not be readable by group or
+			// other. Warn (rather than refuse) so a K8s Secret volume that
+			// defaults to mode 0644 doesn't hard-fail the agent; operators
+			// can tighten the file mode or set the volume defaultMode.
+			if info, statErr := os.Stat(path); statErr == nil && keyFileModeTooOpen(info.Mode()) {
+				slog.Warn("agent private key file is group/other-accessible; tighten to 0600 (or set the Secret volume defaultMode to 0400)",
+					"path", path,
+					"mode", fmt.Sprintf("%#o", info.Mode().Perm()))
+			}
 			if len(data) != 32 {
 				return nil, fmt.Errorf("identity: %s file %q must be exactly 32 raw bytes, got %d", envKeyFile, path, len(data))
 			}
@@ -108,4 +118,11 @@ func LoadOrGenerateKeyPair(envKey, envKeyFile string) (*KeyPair, error) {
 		return nil, fmt.Errorf("identity: generate ephemeral keypair: %w", err)
 	}
 	return &KeyPair{Public: pub, Private: priv, Source: KeyPairSourceEphemeral}, nil
+}
+
+// keyFileModeTooOpen reports whether mode grants any group or other
+// permission bit. A private key should be accessible only by its owner
+// (mode 0600 / 0400); anything looser is a leak risk (AGT-04).
+func keyFileModeTooOpen(mode os.FileMode) bool {
+	return mode.Perm()&0o077 != 0
 }

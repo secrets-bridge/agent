@@ -1,19 +1,25 @@
 // Package executor — resolvers.go: concrete provider resolvers.
 //
 // Each resolver translates the `target_provider_config` map embedded
-// in a patch job's payload (plus agent-level env vars for sensitive
-// connection material like Vault tokens) into a fully constructed
-// core/providers.Provider.
+// in a patch job's payload into a fully constructed
+// core/providers.Provider, combined with agent-level connection identity.
 //
-// The split between job-payload config and agent env vars is
-// deliberate:
+// Trust boundary (AGT-01 hardening):
 //
-//   - Connection ADDRESSES (vault URL, AWS region) come from the job
-//     payload — they're metadata, not sensitive, and they vary per
-//     request.
-//   - AUTH CREDENTIALS (vault token, AWS keys) come from agent env
-//     vars or in-cluster identity (k8s auth, instance role). The
-//     job payload MUST NOT carry credentials — that's a hard rule.
+//   - CONNECTION IDENTITY — where the agent connects (vault address, AWS
+//     region/endpoint) and as whom it connects (roleArn, kubernetes
+//     role/mount/token path, auth method) — is PINNED from agent env or
+//     a vetted local source. It is NEVER read from the job payload. A
+//     requester who could steer these turns the agent into an SSRF,
+//     arbitrary-file-read, and credential-exfil primitive.
+//   - AUTH CREDENTIALS (vault token, AWS keys) come from agent env vars
+//     or in-cluster identity (k8s auth, instance role). The job payload
+//     MUST NOT carry credentials — that's a hard rule.
+//   - The job payload may carry ONLY a small allowlist of non-identity,
+//     per-request routing keys (e.g. Vault kvMount/kvPrefix). Every other
+//     key — connection-steering, credential, or unrecognised — is
+//     refused so the job fails loud rather than silently connecting
+//     somewhere the requester chose.
 package executor
 
 import (
@@ -28,17 +34,50 @@ import (
 	"github.com/secrets-bridge/core/providers/vault"
 )
 
-// Env vars the Vault resolver consults when the job-payload config
-// doesn't carry a connection address or token. Documented here in one
-// place so the helm chart / k8s manifests can mirror them.
+// Env vars the Vault resolver consults for connection identity. These
+// are the ONLY source for connection-steering material — the job payload
+// can never override them. Documented here in one place so the helm
+// chart / k8s manifests can mirror them.
 const (
-	EnvVaultAddr           = "SB_VAULT_ADDR"
-	EnvVaultToken          = "SB_VAULT_TOKEN"
-	EnvVaultNamespace      = "SB_VAULT_NAMESPACE"
-	EnvVaultKVMount        = "SB_VAULT_KV_MOUNT"
-	EnvVaultKVPrefix       = "SB_VAULT_KV_PREFIX"
-	EnvVaultKubernetesRole = "SB_VAULT_KUBERNETES_ROLE"
+	EnvVaultAddr                = "SB_VAULT_ADDR"
+	EnvVaultToken               = "SB_VAULT_TOKEN"
+	EnvVaultNamespace           = "SB_VAULT_NAMESPACE"
+	EnvVaultKVMount             = "SB_VAULT_KV_MOUNT"
+	EnvVaultKVPrefix            = "SB_VAULT_KV_PREFIX"
+	EnvVaultKubernetesRole      = "SB_VAULT_KUBERNETES_ROLE"
+	EnvVaultKubernetesMountPath = "SB_VAULT_KUBERNETES_MOUNT_PATH"
 )
+
+// kubernetesSATokenPath is the projected ServiceAccount token path the
+// agent hard-pins for Vault kubernetes auth. It is NEVER taken from the
+// job payload OR an env var: a requester- (or operator-) controlled token
+// path would let the agent be pointed at an arbitrary local file, read
+// it, and POST its contents to Vault during login — the AGT-01
+// arbitrary-file-read / credential-exfil primitive. The standard
+// projected-token mount is the only vetted source.
+const kubernetesSATokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token" //nolint:gosec // not a credential; a well-known mount path
+
+// vaultSteeringKeys identify WHERE and as WHOM the agent connects. They
+// are pinned from agent env and MUST NOT appear in the job payload
+// (AGT-01). The credential literal (token) is refused separately with a
+// dedicated message.
+var vaultSteeringKeys = map[string]struct{}{
+	vault.ConfigAddress:             {},
+	vault.ConfigNamespace:           {},
+	vault.ConfigAuthMethod:          {},
+	vault.ConfigKubernetesRole:      {},
+	vault.ConfigKubernetesMountPath: {},
+	vault.ConfigKubernetesTokenPath: {},
+}
+
+// vaultPayloadAllowlist are the ONLY keys a job payload may carry for the
+// Vault resolver. They select the KV path layout of the TARGET secret —
+// not the connection identity — so they're safe to vary per request.
+// Any key outside this set is refused.
+var vaultPayloadAllowlist = map[string]struct{}{
+	vault.ConfigKVMount:  {},
+	vault.ConfigKVPrefix: {},
+}
 
 // Env vars the AWS Secrets Manager resolver consults. Credentials
 // themselves come from the standard AWS SDK chain (env vars like
@@ -60,16 +99,18 @@ const (
 
 // VaultResolver implements ProviderResolver for providerType="vault".
 //
-// Config precedence (highest → lowest):
-//  1. job payload `target_provider_config`
-//  2. agent process env vars (SB_VAULT_*)
-//  3. provider defaults (kv mount=kv, k8s auth method)
+// Connection identity (address, namespace, auth method, kubernetes
+// role/mount/token path) comes ONLY from agent env vars (SB_VAULT_*).
+// The job payload may carry ONLY the KV routing keys in
+// vaultPayloadAllowlist (kvMount/kvPrefix). Any other payload key —
+// including any connection-steering key or the token literal — is
+// refused (AGT-01).
 //
-// Auth selection:
-//   - If `token` is set (in payload OR SB_VAULT_TOKEN), use token auth
-//   - Else if SB_VAULT_KUBERNETES_ROLE is set (or payload kubernetesRole),
-//     use k8s auth
-//   - Else error — no auth configured
+// Auth selection (driven entirely by the PINNED env config):
+//   - If SB_VAULT_TOKEN is set, use token auth.
+//   - Else if SB_VAULT_KUBERNETES_ROLE is set, use k8s auth with the
+//     hard-pinned ServiceAccount token path.
+//   - Else error — no auth configured.
 func VaultResolver(ctx context.Context) ProviderResolver {
 	return func(providerType string, config map[string]any) (providers.Provider, error) {
 		if providerType != vault.Kind {
@@ -86,7 +127,8 @@ func VaultResolver(ctx context.Context) ProviderResolver {
 func mergeVaultConfig(payload map[string]any) (providers.Config, error) {
 	out := providers.Config{}
 
-	// Start with env-var fallbacks; payload values override.
+	// Connection identity + credential: pinned from agent env ONLY. The
+	// payload can never steer any of these (AGT-01).
 	setIfEnv := func(key, env string) {
 		if v := os.Getenv(env); v != "" {
 			out[key] = v
@@ -98,44 +140,67 @@ func mergeVaultConfig(payload map[string]any) (providers.Config, error) {
 	setIfEnv(vault.ConfigKVMount, EnvVaultKVMount)
 	setIfEnv(vault.ConfigKVPrefix, EnvVaultKVPrefix)
 	setIfEnv(vault.ConfigKubernetesRole, EnvVaultKubernetesRole)
+	setIfEnv(vault.ConfigKubernetesMountPath, EnvVaultKubernetesMountPath)
 
+	// Validate + apply the payload. Only the vetted, non-identity keys
+	// in vaultPayloadAllowlist are accepted (they may override the env
+	// KV-layout fallbacks); credential literals and connection-steering
+	// keys are refused, and anything unrecognised is refused too so a
+	// new steering key added to core can't silently pass through.
 	for k, v := range payload {
-		// Refuse credential keys in the payload — the api should never
-		// be sending us a vault token. Defense in depth in case a
-		// future PR forgets this rule.
-		if k == vault.ConfigToken {
+		switch {
+		case k == vault.ConfigToken:
 			return nil, errors.New("vault: token MUST NOT be passed via job payload (use agent env var)")
-		}
-		out[k] = v
-	}
-
-	// Pick auth method based on what's present. Vault's New() defaults
-	// to kubernetes auth when the key is absent, which is wrong for
-	// dev / token use — set it explicitly here so the behavior is
-	// predictable.
-	if _, hasMethod := out[vault.ConfigAuthMethod]; !hasMethod {
-		if _, hasToken := out[vault.ConfigToken]; hasToken {
-			out[vault.ConfigAuthMethod] = "token"
-		} else if _, hasRole := out[vault.ConfigKubernetesRole]; hasRole {
-			out[vault.ConfigAuthMethod] = "kubernetes"
-		} else {
-			return nil, errors.New("vault: no auth configured — set SB_VAULT_TOKEN or SB_VAULT_KUBERNETES_ROLE")
+		case isKey(vaultSteeringKeys, k):
+			return nil, fmt.Errorf("vault: connection-steering key %q MUST NOT be passed via job payload (pinned from agent env)", k)
+		case isKey(vaultPayloadAllowlist, k):
+			out[k] = v
+		default:
+			return nil, fmt.Errorf("vault: key %q is not accepted in the job payload", k)
 		}
 	}
 
-	if _, ok := out[vault.ConfigAddress]; !ok {
-		return nil, errors.New("vault: address not configured — set SB_VAULT_ADDR or payload.target_provider_config.address")
+	// Auth method is derived entirely from the PINNED env config, never
+	// the payload. Vault's New() defaults to kubernetes auth when the key
+	// is absent, so set it explicitly for predictable behavior.
+	switch {
+	case hasKey(out, vault.ConfigToken):
+		out[vault.ConfigAuthMethod] = "token"
+	case hasKey(out, vault.ConfigKubernetesRole):
+		out[vault.ConfigAuthMethod] = "kubernetes"
+		// Hard-pin the ServiceAccount token path — never env, never
+		// payload — so the agent can only ever read the well-known
+		// projected-token mount during login (AGT-01).
+		out[vault.ConfigKubernetesTokenPath] = kubernetesSATokenPath
+	default:
+		return nil, errors.New("vault: no auth configured — set SB_VAULT_TOKEN or SB_VAULT_KUBERNETES_ROLE")
+	}
+
+	if !hasKey(out, vault.ConfigAddress) {
+		return nil, errors.New("vault: address not configured — set SB_VAULT_ADDR")
 	}
 	return out, nil
+}
+
+// isKey reports whether k is present in set.
+func isKey(set map[string]struct{}, k string) bool {
+	_, ok := set[k]
+	return ok
+}
+
+// hasKey reports whether the resolved config carries key k.
+func hasKey(c providers.Config, k string) bool {
+	_, ok := c[k]
+	return ok
 }
 
 // AWSSecretsManagerResolver implements ProviderResolver for
 // providerType="aws-sm".
 //
-// Config precedence (highest → lowest):
-//  1. job payload `target_provider_config`
-//  2. agent process env vars (SB_AWS_*)
-//  3. AWS SDK defaults (no region fallback — that's an error)
+// Connection identity (region, endpoint, roleArn) comes ONLY from agent
+// env vars (SB_AWS_*). The job payload may carry ONLY the narrowing
+// ListMetadata tagFilter (awsPayloadAllowlist); any other key —
+// credential, connection-steering, or unrecognised — is refused (AGT-01).
 //
 // Credentials are NEVER passed via this resolver: the underlying
 // core/providers/awssecretsmanager provider relies on the AWS SDK's
@@ -155,17 +220,35 @@ func AWSSecretsManagerResolver(ctx context.Context) ProviderResolver {
 	}
 }
 
-// AWS SDK chain credential env vars. Listed here so the resolver can
-// REFUSE them in the job payload — credentials must never travel from
-// the CP to the agent over the wire. Defense in depth.
-var awsCredentialKeys = []string{
-	"awsAccessKeyID",
-	"awsSecretAccessKey",
-	"awsSessionToken",
-	"accessKeyID",
-	"secretAccessKey",
-	"sessionToken",
-	"credentials",
+// awsCredentialKeys are credential-looking keys the resolver REFUSES in
+// the job payload — credentials must never travel from the CP to the
+// agent over the wire. Defense in depth.
+var awsCredentialKeys = map[string]struct{}{
+	"awsAccessKeyID":     {},
+	"awsSecretAccessKey": {},
+	"awsSessionToken":    {},
+	"accessKeyID":        {},
+	"secretAccessKey":    {},
+	"sessionToken":       {},
+	"credentials":        {},
+}
+
+// awsSteeringKeys identify WHERE and as WHOM the agent connects. They are
+// pinned from agent env (SB_AWS_*) and MUST NOT appear in the job payload
+// (AGT-01).
+var awsSteeringKeys = map[string]struct{}{
+	awssecretsmanager.ConfigRegion:   {},
+	awssecretsmanager.ConfigRoleArn:  {},
+	awssecretsmanager.ConfigEndpoint: {},
+}
+
+// awsPayloadAllowlist are the ONLY keys a job payload may carry for the
+// aws-sm resolver. tagFilter is a ListMetadata NARROWING filter (used by
+// admin-enqueued discover jobs), not connection identity — it selects
+// which secrets are visible, not where/as-whom the agent connects. Every
+// other payload key — credential, steering, or unrecognised — is refused.
+var awsPayloadAllowlist = map[string]struct{}{
+	awssecretsmanager.ConfigTagFilter: {},
 }
 
 func mergeAWSConfig(payload map[string]any) (providers.Config, error) {
@@ -193,20 +276,26 @@ func mergeAWSConfig(payload map[string]any) (providers.Config, error) {
 		}
 	}
 
+	// Validate + apply the payload. Only the vetted, non-identity keys in
+	// awsPayloadAllowlist are accepted; credential literals and
+	// connection-steering keys are refused, and anything unrecognised is
+	// refused too so a new steering key added to core can't silently pass
+	// through (AGT-01).
 	for k, v := range payload {
-		// Refuse any obvious credential key. The underlying provider
-		// doesn't even read these — but a future PR that "helpfully"
-		// adds support would silently leak creds over the wire.
-		for _, banned := range awsCredentialKeys {
-			if k == banned {
-				return nil, fmt.Errorf("aws-sm: %q MUST NOT be passed via job payload (use SDK credential chain)", k)
-			}
+		switch {
+		case isKey(awsCredentialKeys, k):
+			return nil, fmt.Errorf("aws-sm: %q MUST NOT be passed via job payload (use SDK credential chain)", k)
+		case isKey(awsSteeringKeys, k):
+			return nil, fmt.Errorf("aws-sm: connection-steering key %q MUST NOT be passed via job payload (pinned from agent env)", k)
+		case isKey(awsPayloadAllowlist, k):
+			out[k] = v
+		default:
+			return nil, fmt.Errorf("aws-sm: key %q is not accepted in the job payload", k)
 		}
-		out[k] = v
 	}
 
-	if _, ok := out[awssecretsmanager.ConfigRegion]; !ok {
-		return nil, errors.New("aws-sm: region not configured — set SB_AWS_REGION or payload.target_provider_config.region")
+	if !hasKey(out, awssecretsmanager.ConfigRegion) {
+		return nil, errors.New("aws-sm: region not configured — set SB_AWS_REGION")
 	}
 	return out, nil
 }
@@ -217,8 +306,8 @@ func mergeAWSConfig(payload map[string]any) (providers.Config, error) {
 // NotConfiguredResolver so jobs fail loud rather than silently no-op.
 func ResolverByType(ctx context.Context) ProviderResolver {
 	resolvers := map[string]ProviderResolver{
-		vault.Kind:               VaultResolver(ctx),
-		awssecretsmanager.Kind:   AWSSecretsManagerResolver(ctx),
+		vault.Kind:             VaultResolver(ctx),
+		awssecretsmanager.Kind: AWSSecretsManagerResolver(ctx),
 	}
 	return func(providerType string, config map[string]any) (providers.Provider, error) {
 		if r, ok := resolvers[providerType]; ok {

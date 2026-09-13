@@ -169,6 +169,28 @@ func TestGetWrap_SealedButNoKeypair_RefusesSilentDowngrade(t *testing.T) {
 	}
 }
 
+func TestGetWrap_ValueWithKeypair_RefusesSilentDowngrade(t *testing.T) {
+	// AGT-02: the agent holds a registered keypair, but the CP returns a
+	// plaintext value-only response (no sealed envelope). That's a
+	// downgrade — GetWrap must refuse rather than accept plaintext off
+	// the wire, even though the content_hash would otherwise verify.
+	plaintext := []byte("hunter2")
+	sum := sha256.Sum256(plaintext)
+	body := `{"wrap_id":"w","value":"` + base64.StdEncoding.EncodeToString(plaintext) +
+		`","byte_length":7,"content_hash":"` + hex.EncodeToString(sum[:]) + `","algorithm":"AES-256-GCM"}`
+	c, _ := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	})
+	// Non-empty keypair signals "registered"; the value branch never
+	// reaches sealing.Open, so 32-byte dummies are sufficient.
+	pub := make([]byte, 32)
+	priv := make([]byte, 32)
+	_, err := c.GetWrap(t.Context(), "a", "s", "w", pub, priv)
+	if err == nil || !strings.Contains(err.Error(), "downgrade") {
+		t.Fatalf("got %v want silent-downgrade refusal", err)
+	}
+}
+
 func TestPostWrap_LegacyValuePath(t *testing.T) {
 	// useEnvelope=false → POST body carries `value` (base64 plaintext)
 	// and NO envelope. /dek must NOT be called.
