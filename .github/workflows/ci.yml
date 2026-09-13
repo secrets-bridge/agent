@@ -66,10 +66,18 @@ jobs:
             exit 1
           fi
 
-  # The agent MUST NOT carry a DB or Redis driver in its dependency
-  # graph. Importing one would silently violate BRD §15 and §24. This
-  # job greps go.sum for the forbidden module paths and fails the build
-  # if any appear.
+  # The agent MUST NOT carry a DB, Redis/KV, or ORM driver in its
+  # dependency graph. Importing one would silently violate BRD §15 and
+  # §24. This job greps go.sum for forbidden module paths and fails the
+  # build if any appear.
+  #
+  # AGT-03: a permitted-prefix ALLOWLIST would be the tighter design, but
+  # the agent's transitive graph (AWS SDK, HashiCorp Vault, Prometheus, …)
+  # is large and churns on every dependency bump, so an allowlist would be
+  # brittle and high-noise. Instead we keep a deny-list, keep it broad
+  # (SQL, SQLite, alternative Redis/Valkey clients, MSSQL, ClickHouse,
+  # ORMs, etcd), and match as a SUBSTRING (not an anchored prefix) so a
+  # vanity import path or a fork mirror can't slip a driver past the grep.
   no-db-or-redis:
     name: no-db-or-redis
     runs-on: ubuntu-latest
@@ -79,19 +87,37 @@ jobs:
         run: |
           set -e
           FORBIDDEN_PATTERNS=(
+            # SQL drivers
             "github.com/jackc/pgx"
             "github.com/lib/pq"
             "github.com/go-sql-driver/mysql"
+            "go-mssqldb"
+            "clickhouse-go"
+            # SQLite (embedded SQL)
+            "modernc.org/sqlite"
+            "mattn/go-sqlite3"
+            "glebarez/sqlite"
+            # NoSQL
             "go.mongodb.org/mongo-driver"
+            # Redis / Valkey / KV clients
             "github.com/redis/go-redis"
-            "github.com/gomodule/redigo"
             "github.com/go-redis/redis"
+            "github.com/gomodule/redigo"
+            "rueidis"
+            "valkey-go"
+            "mediocregopher/radix"
+            "go.etcd.io/etcd"
+            # ORMs
+            "gorm.io"
+            "uptrace/bun"
           )
           status=0
           for pat in "${FORBIDDEN_PATTERNS[@]}"; do
-            if grep -q -E "^${pat}" go.sum; then
-              echo "::error file=go.sum::forbidden dependency: ${pat}"
-              echo "agents must not depend on a DB or Redis driver (BRD §15, §24)"
+            # -F: literal substring (dots are not wildcards); -i: catch a
+            # fork that varies only in case; no anchor: catch vanity paths.
+            if grep -q -i -F -- "${pat}" go.sum; then
+              echo "::error file=go.sum::forbidden dependency matched: ${pat}"
+              echo "agents must not depend on a DB, Redis/KV, or ORM driver (BRD §15, §24)"
               status=1
             fi
           done
