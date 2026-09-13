@@ -81,11 +81,12 @@ type sealedEnvelopeOnWire struct {
 // decoded plaintext + verified content_hash.
 //
 // Backwards-compat behavior: if the CP response carries a `value`
-// field (no public key registered for this agent yet), we
-// base64-decode it directly. If the CP returned a `sealed` envelope
-// (Piece 8b) but the caller supplied no agentPubKey / agentPrivKey,
-// we fail loud — leaving the wrap unusable rather than silently
-// dropping the protection.
+// field AND this caller has no keypair (legacy, pre-registration), we
+// base64-decode it directly. If the caller HAS a keypair, a value-only
+// response is refused as a downgrade (AGT-02). If the CP returned a
+// `sealed` envelope (Piece 8b) but the caller supplied no agentPubKey /
+// agentPrivKey, we fail loud — leaving the wrap unusable rather than
+// silently dropping the protection.
 //
 // agentPubKey + agentPrivKey are the agent's static X25519 keypair.
 // Pass both nil to use the legacy path (the CP must NOT have a
@@ -155,8 +156,13 @@ func (c *Client) GetWrap(ctx context.Context, agentID, agentSecret, wrapID strin
 // decodeWrapValue returns the plaintext bytes from either of the two
 // shapes the CP might send: `value` (legacy) or `sealed` (Piece 8b).
 //
-// Refuses to silently drop the sealed protection: if the CP sealed
-// the response but the caller didn't provide a keypair, errors out.
+// Refuses to silently drop the sealed protection in BOTH directions:
+//   - if the CP sealed the response but the caller has no keypair, error;
+//   - if the CP returned a plaintext value-only response but the caller
+//     HAS a keypair (i.e. the agent registered a public key and expects
+//     sealed responses), error. A value-only response after registration
+//     is a downgrade — a MITM or a misbehaving/compromised CP stripping
+//     the envelope — and must never be silently accepted (AGT-02).
 func decodeWrapValue(body *wrapResponse, agentPubKey, agentPrivKey []byte) ([]byte, error) {
 	switch {
 	case body.Sealed != nil && body.Value != "":
@@ -185,6 +191,12 @@ func decodeWrapValue(body *wrapResponse, agentPubKey, agentPrivKey []byte) ([]by
 		}
 		return sealing.Open(env, agentPrivKey, agentPubKey)
 	case body.Value != "":
+		// AGT-02 no-silent-downgrade: once this agent holds a keypair,
+		// the CP must seal every response. A plaintext value-only body is
+		// a downgrade — refuse it loud rather than accept plaintext.
+		if len(agentPubKey) > 0 && len(agentPrivKey) > 0 {
+			return nil, errors.New("client: CP returned an unsealed value but this agent has a registered keypair; refusing silent downgrade to plaintext")
+		}
 		return base64.StdEncoding.DecodeString(body.Value)
 	default:
 		return nil, errors.New("client: CP response carries neither value nor sealed envelope")

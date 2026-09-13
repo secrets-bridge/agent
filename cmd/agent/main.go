@@ -86,6 +86,25 @@ const (
 	envAgentSecret = "SB_AGENT_SECRET"
 )
 
+// sealingDecision decides, from the keypair source and the SetPublicKey
+// registration result, whether wire-envelope sealing is active and whether
+// a registration failure is fatal (AGT-02).
+//
+//   - registration succeeded          → sealing active, not fatal
+//   - failed, ephemeral keypair (dev)  → sealing inactive, not fatal
+//     (legacy plaintext-over-TLS fallback; the CP has no key for us)
+//   - failed, persistent keypair       → fatal — refuse to run in a
+//     downgradeable state
+func sealingDecision(source identity.KeyPairSource, regErr error) (sealActive, fatal bool) {
+	if regErr == nil {
+		return true, false
+	}
+	if source == identity.KeyPairSourceEphemeral {
+		return false, false
+	}
+	return false, true
+}
+
 func main() {
 	cfg := loadConfig()
 	logger := observability.NewLogger(os.Getenv("LOG_LEVEL"))
@@ -156,13 +175,38 @@ func main() {
 
 	// Register the public key with the CP so future GetWrap responses
 	// come SEALED. Idempotent — CP no-ops if we already have this key.
-	// Failure here doesn't kill the agent: fall back to the legacy
-	// plaintext-over-TLS path so the daemon stays useful.
-	if err := httpClient.SetPublicKey(ctx, id.AgentID, id.AgentSecret, kp.Public, "x25519"); err != nil {
-		logger.Warn("public-key registration failed — falling back to plaintext-over-TLS",
-			"error", err)
-	} else {
+	//
+	// AGT-02 (no silent downgrade): what happens on failure depends on
+	// the keypair source.
+	//   - Persistent keypair (env/file): the operator provisioned a
+	//     durable key and expects sealed responses. A failed registration
+	//     is FATAL — running would mean either a plaintext downgrade or a
+	//     failing wrap fetch on every job. Fail fast.
+	//   - Ephemeral keypair (dev only): keep the legacy fallback. WARN and
+	//     continue, but do NOT thread the keypair into the executors so
+	//     wrap fetches use the plaintext-over-TLS path (the CP has no key
+	//     for us) instead of tripping the downgrade guard.
+	regErr := httpClient.SetPublicKey(ctx, id.AgentID, id.AgentSecret, kp.Public, "x25519")
+	sealActive, fatal := sealingDecision(kp.Source, regErr)
+	switch {
+	case regErr == nil:
 		logger.Info("public key registered with CP — sealed wire-envelope active")
+	case fatal:
+		logger.Error("public-key registration failed with a PERSISTENT keypair — refusing to run in a downgradeable state (AGT-02); fix CP connectivity, or use an ephemeral keypair (unset SB_AGENT_PRIVATE_KEY[_FILE]) for dev",
+			"error", regErr)
+		os.Exit(1)
+	default:
+		logger.Warn("public-key registration failed — ephemeral keypair, falling back to plaintext-over-TLS",
+			"error", regErr)
+	}
+
+	// Thread the keypair into the executors ONLY when sealing is active
+	// (registration succeeded). A nil keypair keeps the executors on the
+	// legacy path AND stops GetWrap's downgrade guard from rejecting the
+	// CP's (expected) plaintext responses in that mode (AGT-02).
+	var sealPub, sealPriv []byte
+	if sealActive {
+		sealPub, sealPriv = kp.Public, kp.Private
 	}
 
 	// PatchExecutor wires the wrap-fetch client + the dispatching
@@ -173,8 +217,8 @@ func main() {
 	patch := executor.PatchExecutor{
 		AgentID:         id.AgentID,
 		AgentSecret:     id.AgentSecret,
-		AgentPublicKey:  kp.Public,
-		AgentPrivateKey: kp.Private,
+		AgentPublicKey:  sealPub,
+		AgentPrivateKey: sealPriv,
 		Client:          httpClient,
 		ResolveProvider: executor.ResolverByType(ctx),
 	}
@@ -188,8 +232,8 @@ func main() {
 	read := executor.ReadExecutor{
 		AgentID:         id.AgentID,
 		AgentSecret:     id.AgentSecret,
-		AgentPublicKey:  kp.Public,
-		AgentPrivateKey: kp.Private,
+		AgentPublicKey:  sealPub,
+		AgentPrivateKey: sealPriv,
 		Client:          httpClient,
 		ResolveProvider: executor.ResolverByType(ctx),
 	}
