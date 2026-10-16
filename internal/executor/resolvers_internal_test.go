@@ -49,6 +49,7 @@ func TestMergeVaultConfig_PayloadCannotSetTokenPath(t *testing.T) {
 func TestMergeVaultConfig_TokenAuthDerivedFromEnv(t *testing.T) {
 	t.Setenv(EnvVaultAddr, "http://vault:8200")
 	t.Setenv(EnvVaultToken, "s.tok")
+	t.Setenv(EnvVaultKVMount, "secret")
 
 	out, err := mergeVaultConfig(map[string]any{vault.ConfigKVMount: "secret"})
 	if err != nil {
@@ -57,7 +58,8 @@ func TestMergeVaultConfig_TokenAuthDerivedFromEnv(t *testing.T) {
 	if out[vault.ConfigAuthMethod] != "token" {
 		t.Fatalf("authMethod = %v want token", out[vault.ConfigAuthMethod])
 	}
-	// The allowlisted KV key survives; no token path is set for token auth.
+	// The echoed KV key resolves to the pinned mount; no token path is set
+	// for token auth.
 	if out[vault.ConfigKVMount] != "secret" {
 		t.Fatalf("kvMount = %v want secret", out[vault.ConfigKVMount])
 	}
@@ -66,12 +68,12 @@ func TestMergeVaultConfig_TokenAuthDerivedFromEnv(t *testing.T) {
 	}
 }
 
-func TestMergeVaultConfig_EnvKVMountFallbackAndPayloadOverride(t *testing.T) {
+func TestMergeVaultConfig_EnvKVMountFallbackAndPayloadEcho(t *testing.T) {
 	t.Setenv(EnvVaultAddr, "http://vault:8200")
 	t.Setenv(EnvVaultToken, "s.tok")
 	t.Setenv(EnvVaultKVMount, "env-mount")
 
-	// No payload → env fallback.
+	// No payload → env value.
 	out, err := mergeVaultConfig(nil)
 	if err != nil {
 		t.Fatalf("mergeVaultConfig: %v", err)
@@ -80,13 +82,18 @@ func TestMergeVaultConfig_EnvKVMountFallbackAndPayloadOverride(t *testing.T) {
 		t.Fatalf("kvMount = %v want env-mount", out[vault.ConfigKVMount])
 	}
 
-	// Payload kvMount (a non-identity routing key) overrides the env.
-	out, err = mergeVaultConfig(map[string]any{vault.ConfigKVMount: "payload-mount"})
+	// A payload that echoes the env value is accepted and changes nothing.
+	out, err = mergeVaultConfig(map[string]any{vault.ConfigKVMount: "env-mount"})
 	if err != nil {
 		t.Fatalf("mergeVaultConfig: %v", err)
 	}
-	if out[vault.ConfigKVMount] != "payload-mount" {
-		t.Fatalf("kvMount = %v want payload-mount", out[vault.ConfigKVMount])
+	if out[vault.ConfigKVMount] != "env-mount" {
+		t.Fatalf("kvMount = %v want env-mount", out[vault.ConfigKVMount])
+	}
+
+	// A payload naming a different mount is refused (AGT-N-01).
+	if _, err := mergeVaultConfig(map[string]any{vault.ConfigKVMount: "payload-mount"}); err == nil {
+		t.Fatal("payload kvMount overrode the pinned env mount")
 	}
 }
 

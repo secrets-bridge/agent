@@ -39,6 +39,14 @@ const Algorithm = "x25519-hkdf-aes-gcm"
 // at AES-GCM open time.
 var hkdfInfo = []byte("secrets-bridge.wrap.v1")
 
+// Sizes Open checks before any crypto call: X25519 keys, the standard
+// AES-GCM nonce the CP generates (gcm.NonceSize()), and the GCM tag.
+const (
+	x25519KeySize = 32
+	gcmNonceSize  = 12
+	gcmTagSize    = 16
+)
+
 // Envelope mirrors api/pkg/sealing.Envelope — same bytes, agent-side
 // representation. Constructed by the client after JSON+base64 decode.
 type Envelope struct {
@@ -62,6 +70,21 @@ func Open(env *Envelope, recipientPriv, recipientPub []byte) ([]byte, error) {
 	}
 	if env.Algorithm != Algorithm {
 		return nil, fmt.Errorf("sealing: unknown algorithm %q", env.Algorithm)
+	}
+	// AGT-N-05: check every length before touching crypto. gcm.Open
+	// panics on a nonce of the wrong size, and the envelope comes off the
+	// wire, so a malformed response must be an error, not a crash.
+	if len(recipientPub) != x25519KeySize || len(recipientPriv) != x25519KeySize {
+		return nil, fmt.Errorf("sealing: recipient keys must be %d bytes", x25519KeySize)
+	}
+	if len(env.EphemeralPublicKey) != x25519KeySize {
+		return nil, fmt.Errorf("sealing: ephemeral public key must be %d bytes, got %d", x25519KeySize, len(env.EphemeralPublicKey))
+	}
+	if len(env.Nonce) != gcmNonceSize {
+		return nil, fmt.Errorf("sealing: nonce must be %d bytes, got %d", gcmNonceSize, len(env.Nonce))
+	}
+	if len(env.Ciphertext) < gcmTagSize {
+		return nil, fmt.Errorf("sealing: ciphertext shorter than the %d-byte GCM tag", gcmTagSize)
 	}
 	curve := ecdh.X25519()
 	priv, err := curve.NewPrivateKey(recipientPriv)
@@ -91,6 +114,9 @@ func Open(env *Envelope, recipientPriv, recipientPub []byte) ([]byte, error) {
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, fmt.Errorf("sealing: gcm: %w", err)
+	}
+	if gcm.NonceSize() != gcmNonceSize || gcm.Overhead() != gcmTagSize {
+		return nil, fmt.Errorf("sealing: unexpected GCM parameters")
 	}
 	plaintext, err := gcm.Open(nil, env.Nonce, env.Ciphertext, nil)
 	if err != nil {

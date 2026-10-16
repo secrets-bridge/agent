@@ -21,20 +21,18 @@ type fakePostWrapClient struct {
 }
 
 type postWrapCall struct {
-	requestID   string
-	keyName     string
-	plaintext   string
-	useEnvelope bool
+	requestID string
+	keyName   string
+	plaintext string
 }
 
-func (f *fakePostWrapClient) PostWrap(_ context.Context, _, _, requestID, keyName string, plaintext []byte, useEnvelope bool) (*client.PostWrapResponse, error) {
+func (f *fakePostWrapClient) PostWrap(_ context.Context, _, _, requestID, keyName string, plaintext []byte) (*client.PostWrapResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, postWrapCall{
-		requestID:   requestID,
-		keyName:     keyName,
-		plaintext:   string(plaintext),
-		useEnvelope: useEnvelope,
+		requestID: requestID,
+		keyName:   keyName,
+		plaintext: string(plaintext),
 	})
 	if f.err != nil {
 		return nil, f.err
@@ -79,6 +77,8 @@ func TestReadExecutor_HappyPath_SpecificKeys(t *testing.T) {
 	exec := executor.ReadExecutor{
 		AgentID:         "agent-x",
 		AgentSecret:     "secret-x",
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
 		Client:          wc,
 		ResolveProvider: readResolverReturning(provider),
 	}
@@ -120,6 +120,8 @@ func TestReadExecutor_HappyPath_AllKeysWhenEmptyTargets(t *testing.T) {
 	wc := &fakePostWrapClient{}
 	exec := executor.ReadExecutor{
 		AgentID: "a", AgentSecret: "s",
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
 		Client:          wc,
 		ResolveProvider: readResolverReturning(provider),
 	}
@@ -146,6 +148,8 @@ func TestReadExecutor_AllRequestedKeysMissing_Fails(t *testing.T) {
 	wc := &fakePostWrapClient{}
 	exec := executor.ReadExecutor{
 		AgentID: "a", AgentSecret: "s",
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
 		Client:          wc,
 		ResolveProvider: readResolverReturning(provider),
 	}
@@ -176,6 +180,8 @@ func TestReadExecutor_PartialMissingStillSucceeds(t *testing.T) {
 	wc := &fakePostWrapClient{}
 	exec := executor.ReadExecutor{
 		AgentID: "a", AgentSecret: "s",
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
 		Client:          wc,
 		ResolveProvider: readResolverReturning(provider),
 	}
@@ -201,6 +207,8 @@ func TestReadExecutor_NonJSONBundle_WrappedAsSingleValueKey(t *testing.T) {
 	wc := &fakePostWrapClient{}
 	exec := executor.ReadExecutor{
 		AgentID: "a", AgentSecret: "s",
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
 		Client:          wc,
 		ResolveProvider: readResolverReturning(provider),
 	}
@@ -225,6 +233,8 @@ func TestReadExecutor_GetValueFails(t *testing.T) {
 	wc := &fakePostWrapClient{}
 	exec := executor.ReadExecutor{
 		AgentID: "a", AgentSecret: "s",
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
 		Client:          wc,
 		ResolveProvider: readResolverReturning(provider),
 	}
@@ -260,6 +270,8 @@ func TestReadExecutor_PostWrapFails_ReportsProgress(t *testing.T) {
 	wc2 := &countingFailingClient{failOnCall: 2}
 	exec := executor.ReadExecutor{
 		AgentID: "a", AgentSecret: "s",
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
 		Client:          wc2,
 		ResolveProvider: readResolverReturning(provider),
 	}
@@ -284,6 +296,8 @@ func TestReadExecutor_PostWrapFails_ReportsProgress(t *testing.T) {
 func TestReadExecutor_PayloadValidation(t *testing.T) {
 	exec := executor.ReadExecutor{
 		AgentID: "a", AgentSecret: "s",
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
 		Client:          &fakePostWrapClient{},
 		ResolveProvider: readResolverReturning(&fakeGetProvider{}),
 	}
@@ -315,54 +329,30 @@ func TestReadExecutor_PayloadValidation(t *testing.T) {
 	}
 }
 
-func TestReadExecutor_KeypairTogglesEnvelopePath(t *testing.T) {
-	// When AgentPublicKey + AgentPrivateKey are both set, PostWrap is
-	// called with useEnvelope=true. When nil, useEnvelope=false. This is
-	// the agent-side toggle for Piece 8b wire-envelope encryption.
+func TestReadExecutor_WithKeypair_PostsEachKey(t *testing.T) {
+	// With a registered keypair the executor posts through PostWrap, which
+	// always sends the wire envelope (Piece 8b). The no-keypair case is
+	// refused; see TestReadExecutor_NoKeypair_RefusesUnsealedPost.
 	provider := &fakeGetProvider{bytes: []byte(`{"K":"v"}`)}
-
-	t.Run("with keypair → envelope path", func(t *testing.T) {
-		wc := &fakePostWrapClient{}
-		exec := executor.ReadExecutor{
-			AgentID: "a", AgentSecret: "s",
-			AgentPublicKey:  make([]byte, 32),
-			AgentPrivateKey: make([]byte, 32),
-			Client:          wc,
-			ResolveProvider: readResolverReturning(provider),
-		}
-		out := exec.Execute(t.Context(), &client.Job{Payload: map[string]any{
-			"request_id":           "req",
-			"target_provider_type": "vault",
-			"target_secret_ref":    "x",
-		}})
-		if out.Status != client.StatusSucceeded {
-			t.Fatalf("status=%q error=%q", out.Status, out.Error)
-		}
-		if len(wc.calls) != 1 || !wc.calls[0].useEnvelope {
-			t.Fatalf("calls=%+v want useEnvelope=true on single call", wc.calls)
-		}
-	})
-
-	t.Run("without keypair → legacy path", func(t *testing.T) {
-		wc := &fakePostWrapClient{}
-		exec := executor.ReadExecutor{
-			AgentID: "a", AgentSecret: "s",
-			// AgentPublicKey + AgentPrivateKey deliberately nil
-			Client:          wc,
-			ResolveProvider: readResolverReturning(provider),
-		}
-		out := exec.Execute(t.Context(), &client.Job{Payload: map[string]any{
-			"request_id":           "req",
-			"target_provider_type": "vault",
-			"target_secret_ref":    "x",
-		}})
-		if out.Status != client.StatusSucceeded {
-			t.Fatalf("status=%q error=%q", out.Status, out.Error)
-		}
-		if len(wc.calls) != 1 || wc.calls[0].useEnvelope {
-			t.Fatalf("calls=%+v want useEnvelope=false on single call", wc.calls)
-		}
-	})
+	wc := &fakePostWrapClient{}
+	exec := executor.ReadExecutor{
+		AgentID: "a", AgentSecret: "s",
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
+		Client:          wc,
+		ResolveProvider: readResolverReturning(provider),
+	}
+	out := exec.Execute(t.Context(), &client.Job{Payload: map[string]any{
+		"request_id":           "req",
+		"target_provider_type": "vault",
+		"target_secret_ref":    "x",
+	}})
+	if out.Status != client.StatusSucceeded {
+		t.Fatalf("status=%q error=%q", out.Status, out.Error)
+	}
+	if len(wc.calls) != 1 || wc.calls[0].keyName != "K" {
+		t.Fatalf("calls=%+v want one post for K", wc.calls)
+	}
 }
 
 func TestRouter_DispatchesRead(t *testing.T) {
@@ -374,7 +364,6 @@ func TestRouter_DispatchesRead(t *testing.T) {
 				return client.JobOutcome{Status: client.StatusSucceeded}
 			}),
 		},
-		Default: executor.NoOp{},
 	}
 	r.Execute(context.Background(), &client.Job{JobType: "read"})
 	if !called {
@@ -392,7 +381,7 @@ type countingFailingClient struct {
 	count      int
 }
 
-func (c *countingFailingClient) PostWrap(context.Context, string, string, string, string, []byte, bool) (*client.PostWrapResponse, error) {
+func (c *countingFailingClient) PostWrap(context.Context, string, string, string, string, []byte) (*client.PostWrapResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.count++

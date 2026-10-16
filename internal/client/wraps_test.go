@@ -32,13 +32,43 @@ func newServer(t *testing.T, h http.HandlerFunc) (*client.Client, *httptest.Serv
 	return c, srv
 }
 
+// testKeypair returns a fresh X25519 keypair standing in for the one the
+// agent registered with the CP.
+func testKeypair(t *testing.T) (pub, priv []byte) {
+	t.Helper()
+	k, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("genkey: %v", err)
+	}
+	return k.PublicKey().Bytes(), k.Bytes()
+}
+
+// sealedWrapBody builds a CP wrap response sealed to recipientPub, with
+// the given content_hash.
+func sealedWrapBody(t *testing.T, plaintext, recipientPub []byte, contentHash string) map[string]any {
+	t.Helper()
+	ct, nonce, ephPub := fakeSealForTest(t, plaintext, recipientPub)
+	return map[string]any{
+		"wrap_id":      "w",
+		"request_id":   "r",
+		"key_name":     "DB_PASSWORD",
+		"byte_length":  len(plaintext),
+		"content_hash": contentHash,
+		"algorithm":    "AES-256-GCM",
+		"sealed": map[string]string{
+			"algorithm":            sealing.Algorithm,
+			"ciphertext":           base64.StdEncoding.EncodeToString(ct),
+			"nonce":                base64.StdEncoding.EncodeToString(nonce),
+			"ephemeral_public_key": base64.StdEncoding.EncodeToString(ephPub),
+		},
+	}
+}
+
 func TestGetWrap_HappyPath_VerifiesContentHash(t *testing.T) {
+	pub, priv := testKeypair(t)
 	plaintext := []byte("hunter2")
 	sum := sha256.Sum256(plaintext)
-	hashHex := hex.EncodeToString(sum[:])
-	body := `{"wrap_id":"w","request_id":"r","key_name":"DB_PASSWORD","value":"` +
-		base64.StdEncoding.EncodeToString(plaintext) +
-		`","byte_length":7,"content_hash":"` + hashHex + `","algorithm":"AES-256-GCM"}`
+	body := sealedWrapBody(t, plaintext, pub, hex.EncodeToString(sum[:]))
 
 	c, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -51,10 +81,10 @@ func TestGetWrap_HappyPath_VerifiesContentHash(t *testing.T) {
 			t.Errorf("missing X-Agent-Secret header")
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(body))
+		_ = json.NewEncoder(w).Encode(body)
 	})
 
-	got, err := c.GetWrap(t.Context(), "agent-x", "s", "w", nil, nil)
+	got, err := c.GetWrap(t.Context(), "agent-x", "s", "w", pub, priv)
 	if err != nil {
 		t.Fatalf("GetWrap: %v", err)
 	}
@@ -67,13 +97,13 @@ func TestGetWrap_HappyPath_VerifiesContentHash(t *testing.T) {
 }
 
 func TestGetWrap_ContentHashMismatch(t *testing.T) {
-	// Send a hash that won't match the bytes.
-	body := `{"wrap_id":"w","value":"` + base64.StdEncoding.EncodeToString([]byte("hunter2")) +
-		`","byte_length":7,"content_hash":"deadbeef","algorithm":"AES-256-GCM"}`
+	// Send a hash that won't match the opened bytes.
+	pub, priv := testKeypair(t)
+	body := sealedWrapBody(t, []byte("hunter2"), pub, "deadbeef")
 	c, _ := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(body))
+		_ = json.NewEncoder(w).Encode(body)
 	})
-	_, err := c.GetWrap(t.Context(), "a", "s", "w", nil, nil)
+	_, err := c.GetWrap(t.Context(), "a", "s", "w", pub, priv)
 	if !errors.Is(err, client.ErrContentHashMismatch) {
 		t.Fatalf("got %v want ErrContentHashMismatch", err)
 	}
@@ -94,7 +124,7 @@ func TestGetWrap_StatusMapping(t *testing.T) {
 			c, _ := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(tc.status)
 			})
-			_, err := c.GetWrap(t.Context(), "a", "s", "w", nil, nil)
+			_, err := c.GetWrap(t.Context(), "a", "s", "w", make([]byte, 32), make([]byte, 32))
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("got %v want %v", err, tc.want)
 			}
@@ -145,27 +175,20 @@ func TestGetWrap_SealedEnvelope_RoundTrip(t *testing.T) {
 }
 
 func TestGetWrap_SealedButNoKeypair_RefusesSilentDowngrade(t *testing.T) {
-	// Even though we'll fail to decrypt without the keypair, the CP
-	// returned a sealed envelope — the client must refuse loud rather
-	// than silently fall back to legacy.
-	body := map[string]any{
-		"wrap_id":      "w",
-		"byte_length":  4,
-		"content_hash": hex.EncodeToString(sha256.New().Sum(nil)),
-		"algorithm":    "AES-256-GCM",
-		"sealed": map[string]string{
-			"algorithm":            sealing.Algorithm,
-			"ciphertext":           base64.StdEncoding.EncodeToString([]byte("ct")),
-			"nonce":                base64.StdEncoding.EncodeToString(make([]byte, 12)),
-			"ephemeral_public_key": base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		},
-	}
+	// A caller without a keypair can't open a sealed wrap, and fetching
+	// it anyway would consume the single-use wrap on the CP. The client
+	// refuses loud before sending anything.
+	var hits atomic.Int32
 	c, _ := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(body)
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
 	})
 	_, err := c.GetWrap(t.Context(), "agent", "s", "w", nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "no keypair") {
 		t.Fatalf("got %v want refusal mentioning no keypair", err)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("wrap requested without a keypair (%d calls)", hits.Load())
 	}
 }
 
@@ -191,54 +214,32 @@ func TestGetWrap_ValueWithKeypair_RefusesSilentDowngrade(t *testing.T) {
 	}
 }
 
-func TestPostWrap_LegacyValuePath(t *testing.T) {
-	// useEnvelope=false → POST body carries `value` (base64 plaintext)
-	// and NO envelope. /dek must NOT be called.
-	var dekCalled atomic.Bool
-	var capturedBody []byte
+func TestPostWrap_DEKFailureNeverFallsBackToPlaintext(t *testing.T) {
+	// AGT-02: if the DEK can't be issued the post fails. There is no
+	// plaintext `value` fallback, so /wraps must never be called.
+	var wrapsCalled atomic.Bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/agents/a/dek", func(w http.ResponseWriter, _ *http.Request) {
-		dekCalled.Store(true)
-		http.Error(w, "should not be called", http.StatusInternalServerError)
+		http.Error(w, "kms unavailable", http.StatusServiceUnavailable)
 	})
-	mux.HandleFunc("POST /api/v1/agents/a/wraps", func(w http.ResponseWriter, r *http.Request) {
-		capturedBody, _ = io.ReadAll(r.Body)
+	mux.HandleFunc("POST /api/v1/agents/a/wraps", func(w http.ResponseWriter, _ *http.Request) {
+		wrapsCalled.Store(true)
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"wrap_id":"w","request_id":"r","key_name":"K","byte_length":7,"content_hash":"x","expires_at":"2026-05-28T00:00:00Z"}`))
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	c := client.New(srv.URL).WithHTTPClient(srv.Client())
 
-	out, err := c.PostWrap(t.Context(), "a", "s", "r", "K", []byte("hunter2"), false)
-	if err != nil {
-		t.Fatalf("PostWrap: %v", err)
+	if _, err := c.PostWrap(t.Context(), "a", "s", "r", "K", []byte("hunter2")); err == nil {
+		t.Fatal("PostWrap succeeded without a DEK")
 	}
-	if out.WrapID != "w" {
-		t.Fatalf("WrapID = %q", out.WrapID)
-	}
-	if dekCalled.Load() {
-		t.Fatal("DEK was issued on the legacy path — must not happen")
-	}
-	var body client.PostWrapRequest
-	if err := json.Unmarshal(capturedBody, &body); err != nil {
-		t.Fatalf("decode posted body: %v", err)
-	}
-	if body.Envelope != nil {
-		t.Fatalf("envelope was sent on legacy path: %+v", body.Envelope)
-	}
-	if body.Value == "" {
-		t.Fatal("value field was empty on legacy path")
-	}
-	decoded, _ := base64.StdEncoding.DecodeString(body.Value)
-	if string(decoded) != "hunter2" {
-		t.Fatalf("value decodes to %q", decoded)
+	if wrapsCalled.Load() {
+		t.Fatal("wrap posted without the envelope")
 	}
 }
 
 func TestPostWrap_EnvelopePath(t *testing.T) {
-	// useEnvelope=true → /dek is called first, then /wraps carries the
-	// envelope. The captured ciphertext, when decrypted with the same
+	// /dek is called first, then /wraps carries the envelope. The captured ciphertext, when decrypted with the same
 	// DEK plaintext, must recover the original plaintext.
 	dekPlain := make([]byte, 32)
 	if _, err := rand.Read(dekPlain); err != nil {
@@ -253,10 +254,10 @@ func TestPostWrap_EnvelopePath(t *testing.T) {
 	mux.HandleFunc("POST /api/v1/agents/a/dek", func(w http.ResponseWriter, _ *http.Request) {
 		dekCalled.Store(true)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"algorithm":   "aes-256-gcm",
-			"plaintext":   base64.StdEncoding.EncodeToString(dekPlain),
-			"ciphertext":  base64.StdEncoding.EncodeToString(dekCipher),
-			"kms_key_id":  "local:test-key",
+			"algorithm":  "aes-256-gcm",
+			"plaintext":  base64.StdEncoding.EncodeToString(dekPlain),
+			"ciphertext": base64.StdEncoding.EncodeToString(dekCipher),
+			"kms_key_id": "local:test-key",
 		})
 	})
 	mux.HandleFunc("POST /api/v1/agents/a/wraps", func(w http.ResponseWriter, r *http.Request) {
@@ -268,7 +269,7 @@ func TestPostWrap_EnvelopePath(t *testing.T) {
 	t.Cleanup(srv.Close)
 	c := client.New(srv.URL).WithHTTPClient(srv.Client())
 
-	if _, err := c.PostWrap(t.Context(), "a", "s", "r", "K", plaintext, true); err != nil {
+	if _, err := c.PostWrap(t.Context(), "a", "s", "r", "K", plaintext); err != nil {
 		t.Fatalf("PostWrap: %v", err)
 	}
 	if !dekCalled.Load() {
@@ -278,8 +279,12 @@ func TestPostWrap_EnvelopePath(t *testing.T) {
 	if err := json.Unmarshal(capturedBody, &body); err != nil {
 		t.Fatalf("decode posted body: %v", err)
 	}
-	if body.Value != "" {
-		t.Fatalf("value field was sent on envelope path: %q", body.Value)
+	var raw map[string]any
+	if err := json.Unmarshal(capturedBody, &raw); err != nil {
+		t.Fatalf("decode posted body: %v", err)
+	}
+	if _, ok := raw["value"]; ok {
+		t.Fatalf("value field was sent: %v", raw["value"])
 	}
 	if body.Envelope == nil {
 		t.Fatal("envelope was not sent")

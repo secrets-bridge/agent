@@ -67,7 +67,7 @@ func (c *Client) PostSecretsBulk(ctx context.Context, agentID, agentSecret strin
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusCreated:
 		var out SecretBulkResponse
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		if err := decodeJSON(resp.Body, maxBulkResponse, &out); err != nil {
 			return nil, fmt.Errorf("client: decode secrets bulk response: %w", err)
 		}
 		return &out, nil

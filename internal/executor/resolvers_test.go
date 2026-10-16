@@ -34,10 +34,12 @@ func TestVaultResolver_TokenAuth_EnvAddress(t *testing.T) {
 }
 
 func TestVaultResolver_KVMountFromPayloadAccepted(t *testing.T) {
-	// kvMount/kvPrefix are per-request KV-layout keys, NOT connection
-	// identity — they're the only keys the payload may carry.
+	// kvMount/kvPrefix are the only KV-layout keys the payload may carry,
+	// and only as an echo of the agent's pinned values (AGT-N-01).
 	t.Setenv(executor.EnvVaultAddr, "http://localhost:8200")
 	t.Setenv(executor.EnvVaultToken, "test-token")
+	t.Setenv(executor.EnvVaultKVMount, "secret")
+	t.Setenv(executor.EnvVaultKVPrefix, "billing")
 	r := executor.VaultResolver(t.Context())
 	if _, err := r(vault.Kind, map[string]any{
 		vault.ConfigKVMount:  "secret",

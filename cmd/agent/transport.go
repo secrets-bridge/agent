@@ -27,6 +27,13 @@ func validateEndpoint(endpoint string, insecure bool) (*url.URL, error) {
 	}
 	u, err := url.Parse(endpoint)
 	if err != nil {
+		// url.Parse errors quote the whole raw URL, userinfo included;
+		// keep only the reason so the startup error log can't carry a
+		// credential embedded in SB_CP_ENDPOINT (AGT-N-08).
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err
+		}
 		return nil, fmt.Errorf("SB_CP_ENDPOINT is not a valid URL: %w", err)
 	}
 	scheme := strings.ToLower(u.Scheme)
@@ -49,7 +56,8 @@ func validateEndpoint(endpoint string, insecure bool) (*url.URL, error) {
 // CP traffic. When the endpoint is https:// the client gets a TLS
 // config built from system roots + any operator-supplied CA file +
 // optional SNI override. For http:// (dev mode) we still build the
-// same client, just without TLS — the transport is plain.
+// same client, just without TLS — the transport is plain. The client
+// never follows redirects.
 func buildHTTPClient(cfg Config) (*http.Client, error) {
 	tlsCfg, err := buildTLSConfig(cfg)
 	if err != nil {
@@ -63,9 +71,19 @@ func buildHTTPClient(cfg Config) (*http.Client, error) {
 		MaxIdleConns:          16,
 	}
 	return &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: transport,
+		Timeout:       30 * time.Second,
+		Transport:     transport,
+		CheckRedirect: refuseRedirect,
 	}, nil
+}
+
+// refuseRedirect stops the agent's HTTP client from following any
+// redirect (AGT-N-02). Go re-sends custom headers such as X-Agent-Secret
+// to the Location host, including an https -> http downgrade to another
+// host, so a 3xx from the CP is returned to the caller as-is and treated
+// as an error there.
+func refuseRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 // buildTLSConfig returns the *tls.Config to install on the HTTP

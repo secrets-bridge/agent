@@ -54,18 +54,18 @@ var ErrRequestNotApproved = errors.New("client: wrap's owning request is not app
 var ErrContentHashMismatch = errors.New("client: content_hash mismatch — refusing to use plaintext")
 
 // wrapResponse mirrors the WrapPayload JSON shape from
-// internal/handlers/wraps.go in the api repo. EXACTLY ONE of Value
-// (legacy plaintext-over-TLS) or Sealed (wire-envelope, Piece 8b)
-// is populated.
+// internal/handlers/wraps.go in the api repo. The agent only accepts the
+// Sealed (wire-envelope, Piece 8b) shape; Value (legacy plaintext over
+// TLS) is decoded only so a response carrying it can be refused.
 type wrapResponse struct {
-	WrapID      string                 `json:"wrap_id"`
-	RequestID   string                 `json:"request_id,omitempty"`
-	KeyName     string                 `json:"key_name,omitempty"`
-	Value       string                 `json:"value,omitempty"`
-	Sealed      *sealedEnvelopeOnWire  `json:"sealed,omitempty"`
-	ByteLength  int                    `json:"byte_length"`
-	ContentHash string                 `json:"content_hash"`
-	Algorithm   string                 `json:"algorithm"`
+	WrapID      string                `json:"wrap_id"`
+	RequestID   string                `json:"request_id,omitempty"`
+	KeyName     string                `json:"key_name,omitempty"`
+	Value       string                `json:"value,omitempty"`
+	Sealed      *sealedEnvelopeOnWire `json:"sealed,omitempty"`
+	ByteLength  int                   `json:"byte_length"`
+	ContentHash string                `json:"content_hash"`
+	Algorithm   string                `json:"algorithm"`
 }
 
 // sealedEnvelopeOnWire is the JSON shape of the wire-envelope as it
@@ -78,23 +78,20 @@ type sealedEnvelopeOnWire struct {
 }
 
 // GetWrap calls GET /api/v1/agents/:id/wraps/:wrap_id and returns the
-// decoded plaintext + verified content_hash.
+// opened plaintext + verified content_hash.
 //
-// Backwards-compat behavior: if the CP response carries a `value`
-// field AND this caller has no keypair (legacy, pre-registration), we
-// base64-decode it directly. If the caller HAS a keypair, a value-only
-// response is refused as a downgrade (AGT-02). If the CP returned a
-// `sealed` envelope (Piece 8b) but the caller supplied no agentPubKey /
-// agentPrivKey, we fail loud — leaving the wrap unusable rather than
-// silently dropping the protection.
-//
-// agentPubKey + agentPrivKey are the agent's static X25519 keypair.
-// Pass both nil to use the legacy path (the CP must NOT have a
-// public key registered for this agent or it'll seal the response
-// and this call will fail).
+// Sealed only (AGT-02): agentPubKey + agentPrivKey (the agent's static
+// X25519 keypair, registered with the CP at boot) are required, and the
+// call is refused before any request is sent when they are missing, so a
+// single-use wrap is never consumed by a caller that could only read it
+// unsealed. The CP response must carry a `sealed` envelope; a plaintext
+// `value` is refused as a downgrade whether or not it also carries a seal.
 //
 // Caller MUST zero the returned Plaintext slice when done.
 func (c *Client) GetWrap(ctx context.Context, agentID, agentSecret, wrapID string, agentPubKey, agentPrivKey []byte) (*Wrap, error) {
+	if len(agentPubKey) == 0 || len(agentPrivKey) == 0 {
+		return nil, errors.New("client: no keypair; refusing to fetch a wrap that could only be read unsealed")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		c.base+"/api/v1/agents/"+agentID+"/wraps/"+wrapID, http.NoBody)
 	if err != nil {
@@ -125,7 +122,7 @@ func (c *Client) GetWrap(ctx context.Context, agentID, agentSecret, wrapID strin
 	}
 
 	var body wrapResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := decodeJSON(resp.Body, maxWrapResponse, &body); err != nil {
 		return nil, fmt.Errorf("client: decode wrap: %w", err)
 	}
 
@@ -153,54 +150,41 @@ func (c *Client) GetWrap(ctx context.Context, agentID, agentSecret, wrapID strin
 	}, nil
 }
 
-// decodeWrapValue returns the plaintext bytes from either of the two
-// shapes the CP might send: `value` (legacy) or `sealed` (Piece 8b).
+// decodeWrapValue opens the sealed envelope in a wrap response.
 //
-// Refuses to silently drop the sealed protection in BOTH directions:
-//   - if the CP sealed the response but the caller has no keypair, error;
-//   - if the CP returned a plaintext value-only response but the caller
-//     HAS a keypair (i.e. the agent registered a public key and expects
-//     sealed responses), error. A value-only response after registration
-//     is a downgrade — a MITM or a misbehaving/compromised CP stripping
-//     the envelope — and must never be silently accepted (AGT-02).
+// There is no unsealed path (AGT-02). A plaintext `value` is refused
+// whether it comes alone (a MITM or a misbehaving CP stripping the
+// envelope) or next to a seal, and a caller without a keypair is refused
+// too.
 func decodeWrapValue(body *wrapResponse, agentPubKey, agentPrivKey []byte) ([]byte, error) {
 	switch {
 	case body.Sealed != nil && body.Value != "":
 		return nil, errors.New("client: CP returned BOTH sealed and value — unexpected; refusing to choose")
-	case body.Sealed != nil:
-		if len(agentPubKey) == 0 || len(agentPrivKey) == 0 {
-			return nil, errors.New("client: CP returned a sealed envelope but caller has no keypair; refusing to fall back to unsealed")
-		}
-		ct, err := base64.StdEncoding.DecodeString(body.Sealed.Ciphertext)
-		if err != nil {
-			return nil, fmt.Errorf("client: decode sealed ciphertext: %w", err)
-		}
-		nonce, err := base64.StdEncoding.DecodeString(body.Sealed.Nonce)
-		if err != nil {
-			return nil, fmt.Errorf("client: decode sealed nonce: %w", err)
-		}
-		ephPub, err := base64.StdEncoding.DecodeString(body.Sealed.EphemeralPublicKey)
-		if err != nil {
-			return nil, fmt.Errorf("client: decode sealed eph pub: %w", err)
-		}
-		env := &sealing.Envelope{
-			Algorithm:          body.Sealed.Algorithm,
-			Ciphertext:         ct,
-			Nonce:              nonce,
-			EphemeralPublicKey: ephPub,
-		}
-		return sealing.Open(env, agentPrivKey, agentPubKey)
 	case body.Value != "":
-		// AGT-02 no-silent-downgrade: once this agent holds a keypair,
-		// the CP must seal every response. A plaintext value-only body is
-		// a downgrade — refuse it loud rather than accept plaintext.
-		if len(agentPubKey) > 0 && len(agentPrivKey) > 0 {
-			return nil, errors.New("client: CP returned an unsealed value but this agent has a registered keypair; refusing silent downgrade to plaintext")
-		}
-		return base64.StdEncoding.DecodeString(body.Value)
-	default:
-		return nil, errors.New("client: CP response carries neither value nor sealed envelope")
+		return nil, errors.New("client: CP returned an unsealed value; refusing silent downgrade to plaintext")
+	case body.Sealed == nil:
+		return nil, errors.New("client: CP response carries no sealed envelope")
+	case len(agentPubKey) == 0 || len(agentPrivKey) == 0:
+		return nil, errors.New("client: CP returned a sealed envelope but caller has no keypair; refusing to fall back to unsealed")
 	}
+	ct, err := base64.StdEncoding.DecodeString(body.Sealed.Ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("client: decode sealed ciphertext: %w", err)
+	}
+	nonce, err := base64.StdEncoding.DecodeString(body.Sealed.Nonce)
+	if err != nil {
+		return nil, fmt.Errorf("client: decode sealed nonce: %w", err)
+	}
+	ephPub, err := base64.StdEncoding.DecodeString(body.Sealed.EphemeralPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("client: decode sealed eph pub: %w", err)
+	}
+	return sealing.Open(&sealing.Envelope{
+		Algorithm:          body.Sealed.Algorithm,
+		Ciphertext:         ct,
+		Nonce:              nonce,
+		EphemeralPublicKey: ephPub,
+	}, agentPrivKey, agentPubKey)
 }
 
 // Zero overwrites b in place. Best-effort defense against casual
@@ -260,23 +244,15 @@ func (c *Client) SetPublicKey(ctx context.Context, agentID, agentSecret string, 
 // Used by the agent's ReadExecutor: after GetValue returns the bundle,
 // the agent splits by key and POSTs one wrap per key here.
 //
-// EXACTLY ONE of Value or Envelope is populated:
-//
-//   - Value: base64 plaintext over TLS. Legacy path; the api repo
-//     accepts it for backwards-compat with agents that pre-date
-//     Piece 8b. TLS is the only thing protecting it in flight.
-//   - Envelope: agent called /agents/:id/dek for a fresh KMS DEK,
-//     AES-256-GCM-encrypted the plaintext locally with that DEK,
-//     and POSTs the ciphertext + nonce + DEK ciphertext. Plaintext
-//     never crosses the wire — defense against TLS-terminating
-//     proxies and accidental CP-side plaintext logging.
-//
-// Caller MUST zero its plaintext slice after the call returns.
+// The agent only ever sends Envelope: it called /agents/:id/dek for a
+// fresh KMS DEK, AES-256-GCM-encrypted the plaintext locally with that
+// DEK, and posts the ciphertext + nonce + DEK ciphertext. Plaintext never
+// crosses the wire. The api still accepts a legacy base64 `value` from
+// old agents; this agent has no code path that sends one (AGT-02).
 type PostWrapRequest struct {
-	RequestID string             `json:"request_id"`
-	KeyName   string             `json:"key_name"`
-	Value     string             `json:"value,omitempty"`    // base64; legacy path
-	Envelope  *PostWrapEnvelope  `json:"envelope,omitempty"` // wire-envelope path
+	RequestID string            `json:"request_id"`
+	KeyName   string            `json:"key_name"`
+	Envelope  *PostWrapEnvelope `json:"envelope"`
 }
 
 // PostWrapEnvelope mirrors api's CreateWrapEnvelope: the agent-side
@@ -331,7 +307,7 @@ func (c *Client) IssueDEK(ctx context.Context, agentID, agentSecret string) (*DE
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusCreated:
 		var body dekResponse
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		if err := decodeJSON(resp.Body, maxSmallResponse, &body); err != nil {
 			return nil, fmt.Errorf("client: decode dek: %w", err)
 		}
 		pt, err := base64.StdEncoding.DecodeString(body.Plaintext)
@@ -340,6 +316,7 @@ func (c *Client) IssueDEK(ctx context.Context, agentID, agentSecret string) (*DE
 		}
 		ct, err := base64.StdEncoding.DecodeString(body.Ciphertext)
 		if err != nil {
+			Zero(pt)
 			return nil, fmt.Errorf("client: decode dek ciphertext: %w", err)
 		}
 		return &DEK{
@@ -369,43 +346,35 @@ type PostWrapResponse struct {
 
 // PostWrap POSTs a wrap to the CP during the read flow.
 //
-// When useEnvelope is true, the agent calls /agents/:id/dek for a
-// fresh KMS DEK, AES-256-GCM-encrypts the plaintext locally, and
-// sends the ciphertext + nonce + DEK ciphertext. The DEK plaintext
-// is zeroed before the function returns. Plaintext NEVER crosses
-// the wire — defense against TLS-terminating proxies.
-//
-// When useEnvelope is false, the agent base64-encodes the plaintext
-// and sends it over TLS (legacy path; only safe when there is no
-// untrusted proxy between the agent and the CP).
+// The agent calls /agents/:id/dek for a fresh KMS DEK, AES-256-GCM-
+// encrypts the plaintext locally, and sends the ciphertext + nonce + DEK
+// ciphertext. The DEK plaintext is zeroed before the function returns.
+// Plaintext NEVER crosses the wire, and there is no fallback that would
+// send it (AGT-02).
 //
 // The caller's plaintext slice is its responsibility to zero.
-func (c *Client) PostWrap(ctx context.Context, agentID, agentSecret, requestID, keyName string, plaintext []byte, useEnvelope bool) (*PostWrapResponse, error) {
+func (c *Client) PostWrap(ctx context.Context, agentID, agentSecret, requestID, keyName string, plaintext []byte) (*PostWrapResponse, error) {
+	dek, err := c.IssueDEK(ctx, agentID, agentSecret)
+	if err != nil {
+		return nil, fmt.Errorf("client: issue dek: %w", err)
+	}
+	// Zero the DEK plaintext as soon as encryption is done — it must
+	// never sit on the heap past this call.
+	ct, nonce, encErr := sealing.EncryptForCP(plaintext, dek.Plaintext)
+	Zero(dek.Plaintext)
+	if encErr != nil {
+		return nil, fmt.Errorf("client: encrypt for cp: %w", encErr)
+	}
 	reqBody := PostWrapRequest{
 		RequestID: requestID,
 		KeyName:   keyName,
-	}
-	if useEnvelope {
-		dek, err := c.IssueDEK(ctx, agentID, agentSecret)
-		if err != nil {
-			return nil, fmt.Errorf("client: issue dek: %w", err)
-		}
-		// Zero the DEK plaintext as soon as encryption is done — it
-		// must never sit on the heap past this call.
-		ct, nonce, encErr := sealing.EncryptForCP(plaintext, dek.Plaintext)
-		Zero(dek.Plaintext)
-		if encErr != nil {
-			return nil, fmt.Errorf("client: encrypt for cp: %w", encErr)
-		}
-		reqBody.Envelope = &PostWrapEnvelope{
+		Envelope: &PostWrapEnvelope{
 			Algorithm:     "aes-256-gcm",
 			Ciphertext:    base64.StdEncoding.EncodeToString(ct),
 			Nonce:         base64.StdEncoding.EncodeToString(nonce),
 			DEKCiphertext: base64.StdEncoding.EncodeToString(dek.Ciphertext),
 			DEKKMSKeyID:   dek.KMSKeyID,
-		}
-	} else {
-		reqBody.Value = base64.StdEncoding.EncodeToString(plaintext)
+		},
 	}
 
 	body, err := json.Marshal(reqBody)
@@ -430,7 +399,7 @@ func (c *Client) PostWrap(ctx context.Context, agentID, agentSecret, requestID, 
 	switch resp.StatusCode {
 	case http.StatusCreated, http.StatusOK:
 		var out PostWrapResponse
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		if err := decodeJSON(resp.Body, maxSmallResponse, &out); err != nil {
 			return nil, fmt.Errorf("client: decode post-wrap response: %w", err)
 		}
 		return &out, nil

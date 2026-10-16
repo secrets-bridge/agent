@@ -16,10 +16,10 @@ import (
 // --- fakes ----------------------------------------------------------
 
 type fakeWrapClient struct {
-	values map[string]string // wrap_id -> plaintext
+	values  map[string]string // wrap_id -> plaintext
 	keyName map[string]string // wrap_id -> key_name
-	err    error
-	calls  []string
+	err     error
+	calls   []string
 }
 
 func (f *fakeWrapClient) GetWrap(_ context.Context, _, _, wrapID string, _, _ []byte) (*client.Wrap, error) {
@@ -104,6 +104,8 @@ func TestPatchExecutor_HappyPath_NewBundle(t *testing.T) {
 	exec := executor.PatchExecutor{
 		AgentID:         "agent-x",
 		AgentSecret:     "secret-x",
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
 		Client:          wc,
 		ResolveProvider: resolverReturning(fp),
 	}
@@ -148,6 +150,8 @@ func TestPatchExecutor_HappyPath_MergesWithExisting(t *testing.T) {
 	}
 	exec := executor.PatchExecutor{
 		AgentID: "a", AgentSecret: "s", Client: wc,
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
 		ResolveProvider: resolverReturning(fp),
 	}
 	job := &client.Job{Payload: map[string]any{
@@ -174,6 +178,8 @@ func TestPatchExecutor_WrapFetchFails_NoPutValue(t *testing.T) {
 	wc := &fakeWrapClient{err: client.ErrWrapGone}
 	exec := executor.PatchExecutor{
 		AgentID: "a", AgentSecret: "s", Client: wc,
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
 		ResolveProvider: resolverReturning(fp),
 	}
 	job := &client.Job{Payload: map[string]any{
@@ -201,6 +207,8 @@ func TestPatchExecutor_ProviderPutFails_PropagatesError(t *testing.T) {
 	}
 	exec := executor.PatchExecutor{
 		AgentID: "a", AgentSecret: "s", Client: wc,
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
 		ResolveProvider: resolverReturning(fp),
 	}
 	job := &client.Job{Payload: map[string]any{
@@ -220,7 +228,9 @@ func TestPatchExecutor_ProviderPutFails_PropagatesError(t *testing.T) {
 func TestPatchExecutor_PayloadValidation(t *testing.T) {
 	exec := executor.PatchExecutor{
 		AgentID: "a", AgentSecret: "s",
-		Client: &fakeWrapClient{},
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
+		Client:          &fakeWrapClient{},
 		ResolveProvider: resolverReturning(&fakeProvider{}),
 	}
 	cases := []struct {
@@ -264,7 +274,6 @@ func TestPatchExecutor_PayloadValidation(t *testing.T) {
 
 func TestRouter_DispatchesByJobType(t *testing.T) {
 	patchCalled := false
-	defaultCalled := false
 	r := executor.Router{
 		ByType: map[string]executor.Executor{
 			"patch": executorFunc(func(ctx context.Context, job *client.Job) client.JobOutcome {
@@ -272,23 +281,18 @@ func TestRouter_DispatchesByJobType(t *testing.T) {
 				return client.JobOutcome{Status: client.StatusSucceeded}
 			}),
 		},
-		Default: executorFunc(func(context.Context, *client.Job) client.JobOutcome {
-			defaultCalled = true
-			return client.JobOutcome{Status: client.StatusSucceeded}
-		}),
 	}
-	r.Execute(t.Context(), &client.Job{JobType: "patch"})
-	if !patchCalled || defaultCalled {
-		t.Fatalf("patch called=%v default called=%v want patch only", patchCalled, defaultCalled)
+	if out := r.Execute(t.Context(), &client.Job{JobType: "patch"}); !patchCalled || out.Status != client.StatusSucceeded {
+		t.Fatalf("patch called=%v status=%q want patch dispatched", patchCalled, out.Status)
 	}
-	patchCalled, defaultCalled = false, false
-	r.Execute(t.Context(), &client.Job{JobType: "sync"})
-	if patchCalled || !defaultCalled {
-		t.Fatalf("for sync job: patch=%v default=%v want default only", patchCalled, defaultCalled)
+	patchCalled = false
+	out := r.Execute(t.Context(), &client.Job{JobType: "sync"})
+	if patchCalled || out.Status != client.StatusFailed {
+		t.Fatalf("for sync job: patch=%v status=%q want failed without dispatch", patchCalled, out.Status)
 	}
 }
 
-func TestRouter_NoMatchNoDefault_Fails(t *testing.T) {
+func TestRouter_NoMatch_Fails(t *testing.T) {
 	r := executor.Router{}
 	out := r.Execute(t.Context(), &client.Job{JobType: "weird"})
 	if out.Status != client.StatusFailed {

@@ -41,7 +41,7 @@ CI also runs `no-db-or-redis`, which fails the build if `go.sum` contains any da
 - **Provider credentials come from the platform** (IRSA, instance role, Vault Kubernetes auth) or agent env. Never accept credentials, tokens or connection identity from a job payload; refuse them.
 - **Never log values.** Error messages name wrap IDs, key names and counts only. Zero plaintext buffers after use.
 - Refuse `http://` control plane URLs unless `SB_INSECURE_TRANSPORT=true` (dev only). TLS 1.2 minimum.
-- Never silently fall back from sealed to unsealed payloads.
+- Never fall back from sealed to unsealed payloads. The agent registers its public key (with retry) before it claims any job, and without a keypair the executors refuse to move values.
 - Keep dependencies minimal; new SDKs only when a provider needs them.
 
 ## Contributing

@@ -61,6 +61,9 @@ func (d DiscoverExecutor) Execute(ctx context.Context, job *client.Job) client.J
 	if err != nil {
 		return fail("payload: " + err.Error())
 	}
+	if err := checkDiscoverScope(payload.TargetProviderType, payload.Scope); err != nil {
+		return fail("payload: " + err.Error())
+	}
 
 	provider, err := d.ResolveProvider(payload.TargetProviderType, payload.TargetProviderConfig)
 	if err != nil {

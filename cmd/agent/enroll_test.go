@@ -68,7 +68,10 @@ func TestResolveIdentity_FirstBootEnrollsPersists_RestartReuses(t *testing.T) {
 		t.Fatalf("credential not persisted: %+v", persisted)
 	}
 
-	// Restart: same cfg (token still set) → reuse the file, do NOT re-enroll.
+	// Restart: the env still carries the token (resolveIdentity scrubbed
+	// it from this process; a new pod gets it again) → reuse the file, do
+	// NOT re-enroll.
+	cfg.EnrollmentToken = "ENROLL-TOKEN-SECRET"
 	id2, src2, err := resolveIdentity(context.Background(), &cfg, c, quietLogger())
 	if err != nil {
 		t.Fatalf("restart resolveIdentity: %v", err)

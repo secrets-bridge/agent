@@ -33,17 +33,22 @@ type Client struct {
 }
 
 // New constructs a Client bound to the given Control Plane base URL.
+// The client never follows redirects (AGT-N-02).
 func New(base string) *Client {
 	return &Client{
 		base: base,
-		hc:   &http.Client{Timeout: 30 * time.Second},
+		hc:   &http.Client{Timeout: 30 * time.Second, CheckRedirect: refuseRedirect},
 	}
 }
 
-// WithHTTPClient swaps the underlying http.Client. Useful for tests
-// that inject httptest.Server transport or custom TLS config.
+// WithHTTPClient swaps the underlying http.Client (custom TLS, or an
+// httptest transport in tests). The Client keeps its own shallow copy with
+// the no-redirect policy forced on, so a caller-supplied client that would
+// follow redirects can't leak X-Agent-Secret to another host (AGT-N-02).
 func (c *Client) WithHTTPClient(hc *http.Client) *Client {
-	c.hc = hc
+	cp := *hc
+	cp.CheckRedirect = refuseRedirect
+	c.hc = &cp
 	return c
 }
 
@@ -102,9 +107,11 @@ func (c *Client) Heartbeat(ctx context.Context, agentID, agentSecret string, rep
 		return &HeartbeatResult{}, nil
 	case http.StatusOK:
 		var out HeartbeatResult
-		// A 200 always carries the richer body; a decode failure is
-		// non-fatal — treat it as "no suggested cadence".
-		_ = json.NewDecoder(resp.Body).Decode(&out)
+		// A 200 always carries the richer body; a decode failure (or an
+		// oversized body) is non-fatal — treat it as "no suggested cadence".
+		if err := decodeJSON(resp.Body, maxSmallResponse, &out); err != nil {
+			return &HeartbeatResult{}, nil
+		}
 		return &out, nil
 	case http.StatusUnauthorized:
 		return nil, ErrUnauthorized
@@ -122,11 +129,20 @@ type HTTPError struct {
 }
 
 func (e *HTTPError) Error() string {
+	if e.Status >= 300 && e.Status < 400 {
+		// The agent never follows redirects (AGT-N-02); a 3xx from the
+		// CP is a misconfiguration or an attempt to move the agent's
+		// credential somewhere else.
+		return fmt.Sprintf("client: http %d: redirect refused", e.Status)
+	}
 	return fmt.Sprintf("client: http %d: %s", e.Status, e.Body)
 }
 
+// drainAndClose consumes a bounded amount of the body so the connection
+// can be reused, then closes it. A body longer than maxDrain just costs
+// the connection.
 func drainAndClose(rc io.ReadCloser) {
-	_, _ = io.Copy(io.Discard, rc)
+	_, _ = io.Copy(io.Discard, io.LimitReader(rc, maxDrain))
 	_ = rc.Close()
 }
 

@@ -237,6 +237,9 @@ func TestDiscoverExecutor_EmptyListIsSuccess(t *testing.T) {
 }
 
 func TestDiscoverExecutor_ScopeAndLabelSelectorPassThrough(t *testing.T) {
+	// A Vault scope is accepted only when it echoes the agent's pinned
+	// kv prefix (AGT-N-01).
+	t.Setenv(executor.EnvVaultKVPrefix, "billing")
 	provider := &fakeListProvider{}
 	exec := executor.DiscoverExecutor{
 		AgentID: "a", AgentSecret: "s", ClusterName: "c",
@@ -265,7 +268,6 @@ func TestRouter_DispatchesDiscover(t *testing.T) {
 				return client.JobOutcome{Status: client.StatusSucceeded}
 			}),
 		},
-		Default: executor.NoOp{},
 	}
 	r.Execute(context.Background(), &client.Job{JobType: "discover"})
 	if !called {

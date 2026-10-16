@@ -57,7 +57,7 @@ func (c *Client) ClaimJob(ctx context.Context, agentID, agentSecret string) (*Jo
 	switch resp.StatusCode {
 	case http.StatusOK:
 		var j Job
-		if err := json.NewDecoder(resp.Body).Decode(&j); err != nil {
+		if err := decodeJSON(resp.Body, maxJobResponse, &j); err != nil {
 			return nil, fmt.Errorf("client: decode job: %w", err)
 		}
 		return &j, nil
