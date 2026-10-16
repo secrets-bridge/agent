@@ -1,0 +1,30 @@
+# Keep VCS data, local env files and cruft out of the build context.
+
+# VCS and CI
+.git
+.github
+.gitignore
+.dockerignore
+
+# Local env files can carry credentials
+**/.env
+**/.env.*
+
+# Docs, not needed by go build
+**/*.md
+
+# Local build output
+/bin/
+/out/
+**/*.exe
+**/*.test
+**/*.prof
+**/coverage.out
+**/coverage.txt
+
+# Editor and OS cruft
+.idea/
+.vscode/
+**/*.swp
+**/*~
+**/.DS_Store
