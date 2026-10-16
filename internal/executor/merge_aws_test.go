@@ -68,10 +68,9 @@ func TestMergeAWSConfig_TagFilterBadJSONFailsLoud(t *testing.T) {
 	}
 }
 
-func TestMergeAWSConfig_PayloadTagFilterOverridesEnv(t *testing.T) {
-	// Discovery jobs may layer their own narrowing filter in the
-	// payload. Payload wins per the documented precedence; the
-	// provider AND's both filters internally.
+func TestMergeAWSConfig_PayloadTagFilterIsANDedWithEnv(t *testing.T) {
+	// Discovery jobs may layer their own narrowing filter in the payload.
+	// It is ANDed with the env filter; it never replaces it (AGT-N-03).
 	t.Setenv(EnvAWSRegion, "us-east-1")
 	t.Setenv(EnvAWSTagFilter, `{"EnvironmentName":"tenant-a-uat"}`)
 	cfg, err := mergeAWSConfig(map[string]any{
@@ -82,8 +81,8 @@ func TestMergeAWSConfig_PayloadTagFilterOverridesEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mergeAWSConfig: %v", err)
 	}
-	got := cfg[awssecretsmanager.ConfigTagFilter]
-	if m, ok := got.(map[string]any); !ok || m["Project"] != "project-alpha" {
-		t.Errorf("expected payload to override env, got %T %+v", got, got)
+	got, ok := cfg[awssecretsmanager.ConfigTagFilter].(map[string]string)
+	if !ok || got["EnvironmentName"] != "tenant-a-uat" || got["Project"] != "project-alpha" || len(got) != 2 {
+		t.Errorf("expected env AND payload filter, got %T %+v", cfg[awssecretsmanager.ConfigTagFilter], cfg[awssecretsmanager.ConfigTagFilter])
 	}
 }

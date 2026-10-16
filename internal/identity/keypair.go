@@ -76,40 +76,20 @@ func LoadOrGenerateKeyPair(envKey, envKeyFile string) (*KeyPair, error) {
 
 	// 2. file path mode
 	if path := os.Getenv(envKeyFile); path != "" {
-		if data, err := os.ReadFile(path); err == nil {
-			// AGT-04: a private key file must not be readable by group or
-			// other. Warn (rather than refuse) so a K8s Secret volume that
-			// defaults to mode 0644 doesn't hard-fail the agent; operators
-			// can tighten the file mode or set the volume defaultMode.
-			if info, statErr := os.Stat(path); statErr == nil && keyFileModeTooOpen(info.Mode()) {
-				slog.Warn("agent private key file is group/other-accessible; tighten to 0600 (or set the Secret volume defaultMode to 0400)",
-					"path", path,
-					"mode", fmt.Sprintf("%#o", info.Mode().Perm()))
-			}
-			if len(data) != 32 {
-				return nil, fmt.Errorf("identity: %s file %q must be exactly 32 raw bytes, got %d", envKeyFile, path, len(data))
-			}
-			pub, err := sealing.PublicFromPrivate(data)
-			if err != nil {
-				return nil, fmt.Errorf("identity: derive public key: %w", err)
-			}
-			return &KeyPair{Public: pub, Private: data, Source: KeyPairSourceFileLoaded}, nil
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("identity: read %s: %w", path, err)
+		kp, err := loadKeyFile(envKeyFile, path)
+		if !errors.Is(err, os.ErrNotExist) {
+			return kp, err
 		}
-
 		// File path was set but doesn't exist yet — generate + write.
-		pub, priv, err := sealing.GenerateKeypair()
-		if err != nil {
-			return nil, fmt.Errorf("identity: generate keypair: %w", err)
+		kp, err = generateKeyFile(path)
+		if errors.Is(err, os.ErrExist) {
+			// Another process (a second replica on a shared volume, or a
+			// restarted container racing the old one) created the file
+			// between our read and our create. Use its key instead of
+			// overwriting it, so every process agrees with the file.
+			return loadKeyFile(envKeyFile, path)
 		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return nil, fmt.Errorf("identity: mkdir %s: %w", filepath.Dir(path), err)
-		}
-		if err := os.WriteFile(path, priv, 0o600); err != nil {
-			return nil, fmt.Errorf("identity: write %s: %w", path, err)
-		}
-		return &KeyPair{Public: pub, Private: priv, Source: KeyPairSourceFileGenerated}, nil
+		return kp, err
 	}
 
 	// 3. neither configured — ephemeral
@@ -118,6 +98,97 @@ func LoadOrGenerateKeyPair(envKey, envKeyFile string) (*KeyPair, error) {
 		return nil, fmt.Errorf("identity: generate ephemeral keypair: %w", err)
 	}
 	return &KeyPair{Public: pub, Private: priv, Source: KeyPairSourceEphemeral}, nil
+}
+
+// loadKeyFile reads an existing 32-byte private key file. A missing file
+// comes back as an error matching os.ErrNotExist.
+func loadKeyFile(envKeyFile, path string) (*KeyPair, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("identity: read %s: %w", path, err)
+	}
+	// AGT-04: a private key file must not be readable by group or
+	// other. Warn (rather than refuse) so a K8s Secret volume that
+	// defaults to mode 0644 doesn't hard-fail the agent; operators
+	// can tighten the file mode or set the volume defaultMode.
+	if info, statErr := os.Stat(path); statErr == nil && keyFileModeTooOpen(info.Mode()) {
+		slog.Warn("agent private key file is group/other-accessible; tighten to 0600 (or set the Secret volume defaultMode to 0400)",
+			"path", path,
+			"mode", fmt.Sprintf("%#o", info.Mode().Perm()))
+	}
+	if len(data) != 32 {
+		return nil, fmt.Errorf("identity: %s file %q must be exactly 32 raw bytes, got %d", envKeyFile, path, len(data))
+	}
+	pub, err := sealing.PublicFromPrivate(data)
+	if err != nil {
+		return nil, fmt.Errorf("identity: derive public key: %w", err)
+	}
+	return &KeyPair{Public: pub, Private: data, Source: KeyPairSourceFileLoaded}, nil
+}
+
+// generateKeyFile creates a fresh keypair and publishes the private key at
+// path atomically, mode 0600 (AGT-04). The key is written and synced to a
+// temp file in the same directory, then hard-linked into place: link(2)
+// never overwrites, so an existing key (or a symlink planted at path) makes
+// it fail with os.ErrExist, and a reader never sees a partly written file.
+// On a filesystem without hard links it falls back to an O_CREATE|O_EXCL
+// create, which keeps the no-overwrite and no-symlink guarantees.
+func generateKeyFile(path string) (*KeyPair, error) {
+	pub, priv, err := sealing.GenerateKeypair()
+	if err != nil {
+		return nil, fmt.Errorf("identity: generate keypair: %w", err)
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("identity: mkdir %s: %w", dir, err)
+	}
+
+	tmp, err := os.CreateTemp(dir, ".agent-key-*.tmp") // created 0600
+	if err != nil {
+		return nil, fmt.Errorf("identity: create temp key in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := writeSyncClose(tmp, priv); err != nil {
+		return nil, fmt.Errorf("identity: write temp key: %w", err)
+	}
+
+	linkErr := linkFile(tmpName, path)
+	switch {
+	case linkErr == nil:
+	case errors.Is(linkErr, os.ErrExist):
+		return nil, fmt.Errorf("identity: create %s: %w", path, linkErr)
+	default:
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("identity: create %s: %w", path, err)
+		}
+		if err := writeSyncClose(f, priv); err != nil {
+			// Never leave a short key file behind: the next start would
+			// refuse it as "must be exactly 32 raw bytes".
+			_ = os.Remove(path)
+			return nil, fmt.Errorf("identity: write %s: %w", path, err)
+		}
+	}
+	return &KeyPair{Public: pub, Private: priv, Source: KeyPairSourceFileGenerated}, nil
+}
+
+// linkFile is os.Link; a variable only so tests can exercise the
+// no-hard-link fallback.
+var linkFile = os.Link
+
+func writeSyncClose(f *os.File, b []byte) error {
+	_, err := f.Write(b)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // keyFileModeTooOpen reports whether mode grants any group or other

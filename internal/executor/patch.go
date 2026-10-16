@@ -38,10 +38,8 @@ import (
 // Defined here as an interface so unit tests can swap in a fake.
 //
 // agentPubKey / agentPrivKey are the agent's static X25519 keypair
-// (wire-envelope, Piece 8b). When the CP returned a sealed response,
-// GetWrap uses the keypair to decrypt. Pass nil for both to keep the
-// legacy plaintext-over-TLS path; the CP MUST NOT have a public key
-// registered for this agent in that mode or GetWrap will fail loud.
+// (wire-envelope, Piece 8b). GetWrap uses them to open the sealed
+// response and refuses to run without them; there is no plaintext path.
 type WrapClient interface {
 	GetWrap(ctx context.Context, agentID, agentSecret, wrapID string, agentPubKey, agentPrivKey []byte) (*client.Wrap, error)
 }
@@ -60,19 +58,29 @@ func NotConfiguredResolver(providerType string, _ map[string]any) (providers.Pro
 }
 
 // PatchExecutor implements Executor for job_type=patch jobs.
+//
+// AgentPublicKey/AgentPrivateKey are the registered keypair used to open
+// sealed wraps. An empty keypair means sealing is not active and the job
+// is refused before any wrap is fetched (AGT-02).
 type PatchExecutor struct {
-	AgentID          string
-	AgentSecret      string
-	AgentPublicKey   []byte // nil = legacy plaintext-over-TLS path
-	AgentPrivateKey  []byte
-	Client           WrapClient
-	ResolveProvider  ProviderResolver
+	AgentID         string
+	AgentSecret     string
+	AgentPublicKey  []byte
+	AgentPrivateKey []byte
+	Client          WrapClient
+	ResolveProvider ProviderResolver
 }
 
 // Execute runs one patch job to completion.
 func (p PatchExecutor) Execute(ctx context.Context, job *client.Job) client.JobOutcome {
 	payload, err := parsePatchPayload(job.Payload)
 	if err != nil {
+		return fail("payload: " + err.Error())
+	}
+	if !sealingReady(p.AgentPublicKey, p.AgentPrivateKey) {
+		return fail(errSealingNotActive)
+	}
+	if err := checkSecretRef(payload.TargetProviderType, payload.TargetSecretRef); err != nil {
 		return fail("payload: " + err.Error())
 	}
 
@@ -228,4 +236,13 @@ func readExistingBundle(ctx context.Context, p providers.Provider, ref providers
 
 func fail(msg string) client.JobOutcome {
 	return client.JobOutcome{Status: client.StatusFailed, Error: msg}
+}
+
+// errSealingNotActive is the job error when an executor has no registered
+// keypair. Values only move sealed; without a keypair the job fails rather
+// than falling back to plaintext over TLS (AGT-02).
+const errSealingNotActive = "sealing not active (no registered keypair); refusing to move values unsealed"
+
+func sealingReady(pub, priv []byte) bool {
+	return len(pub) > 0 && len(priv) > 0
 }

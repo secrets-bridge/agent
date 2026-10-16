@@ -26,6 +26,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -99,13 +101,14 @@ func LoadStored(envAgentID, envAgentSecret, filePath string) (Identity, Source, 
 		return Identity{AgentID: id, AgentSecret: secret}, SourceEnv, nil
 	}
 
-	data, err := os.ReadFile(filePath)
+	data, err := readCredentialFile(filePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return Identity{}, "", ErrNotConfigured
 	}
 	if err != nil {
 		return Identity{}, "", fmt.Errorf("identity: read %q: %w", filePath, err)
 	}
+	defer zeroBytes(data)
 	var id Identity
 	if err := json.Unmarshal(data, &id); err != nil {
 		return Identity{}, "", fmt.Errorf("identity: parse %q: %w", filePath, err)
@@ -164,10 +167,11 @@ func Save(filePath string, id Identity) error {
 
 // loadFromFile reads the JSON identity file.
 func loadFromFile(path string) (Identity, error) {
-	data, err := os.ReadFile(path)
+	data, err := readCredentialFile(path)
 	if err != nil {
 		return Identity{}, err
 	}
+	defer zeroBytes(data)
 	var id Identity
 	if err := json.Unmarshal(data, &id); err != nil {
 		return Identity{}, fmt.Errorf("parse %s: %w", path, err)
@@ -176,4 +180,72 @@ func loadFromFile(path string) (Identity, error) {
 		return Identity{}, errors.New("identity file missing agent_id or agent_secret")
 	}
 	return id, nil
+}
+
+// maxIdentityFileSize caps how much of the identity file is read. A real
+// one is a few hundred bytes of JSON.
+const maxIdentityFileSize = 64 << 10
+
+// tightenFileMode drops permission bits on an open identity file. It is a
+// variable only so tests can simulate a file whose mode can't be changed
+// (a read-only Secret mount, a file owned by another user).
+var tightenFileMode = func(f *os.File, mode os.FileMode) error { return f.Chmod(mode) }
+
+// readCredentialFile reads the identity file, which holds the agent's
+// bearer secret, after checking its mode on the open descriptor (AGT-04):
+//
+//   - any "other" permission bit → refused. Every local user could have
+//     read the secret; the operator has to fix the mode and should rotate.
+//   - group bits only → dropped to owner-only before the read, and refused
+//     if that fails. kubelet adds g+rw to every file on a volume when the
+//     pod sets fsGroup (the agent chart does), so an enrolled agent's own
+//     0600 file comes back 0660 after a restart. Tightening it keeps the
+//     credential owner-only without crash-looping that agent.
+//   - not a regular file → refused.
+//
+// os.ErrNotExist is passed through unwrapped-compatible so LoadStored can
+// map it to ErrNotConfigured.
+func readCredentialFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("identity: %q is not a regular file", path)
+	}
+	perm := info.Mode().Perm()
+	switch {
+	case perm&0o007 != 0:
+		return nil, fmt.Errorf("identity: %q has mode %#o; the credential file must not be accessible to other users (chmod 0600, then rotate the agent secret)", path, perm)
+	case perm&0o070 != 0:
+		if err := tightenFileMode(f, perm&^0o077); err != nil {
+			return nil, fmt.Errorf("identity: %q has mode %#o and could not be tightened to owner-only (chmod 0600): %w", path, perm, err)
+		}
+		slog.Warn("identity file was group-accessible; tightened to owner-only before reading (on Kubernetes, fsGroup re-adds group bits at mount; set fsGroupChangePolicy: OnRootMismatch to stop that)",
+			"path", path,
+			"mode_was", fmt.Sprintf("%#o", perm))
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, maxIdentityFileSize+1))
+	if err != nil {
+		zeroBytes(data)
+		return nil, err
+	}
+	if len(data) > maxIdentityFileSize {
+		zeroBytes(data)
+		return nil, fmt.Errorf("identity: %q is larger than %d bytes", path, maxIdentityFileSize)
+	}
+	return data, nil
+}
+
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }

@@ -15,11 +15,14 @@
 //   - AUTH CREDENTIALS (vault token, AWS keys) come from agent env vars
 //     or in-cluster identity (k8s auth, instance role). The job payload
 //     MUST NOT carry credentials — that's a hard rule.
-//   - The job payload may carry ONLY a small allowlist of non-identity,
-//     per-request routing keys (e.g. Vault kvMount/kvPrefix). Every other
-//     key — connection-steering, credential, or unrecognised — is
-//     refused so the job fails loud rather than silently connecting
-//     somewhere the requester chose.
+//   - The job payload may carry ONLY a small allowlist of non-identity
+//     keys, and none of them may widen what the agent can reach
+//     (AGT-N-01, AGT-N-03): Vault kvMount/kvPrefix are accepted only as an
+//     echo of the agent's own pinned value, and an aws-sm tagFilter is
+//     ANDed with SB_AWS_TAG_FILTER (it can add constraints, never drop
+//     one). Every other key — connection-steering, credential, or
+//     unrecognised — is refused so the job fails loud rather than
+//     silently connecting somewhere the requester chose.
 package executor
 
 import (
@@ -71,9 +74,11 @@ var vaultSteeringKeys = map[string]struct{}{
 }
 
 // vaultPayloadAllowlist are the ONLY keys a job payload may carry for the
-// Vault resolver. They select the KV path layout of the TARGET secret —
-// not the connection identity — so they're safe to vary per request.
-// Any key outside this set is refused.
+// Vault resolver. They describe the KV path layout, which is pinned from
+// agent env just like the connection: the payload may repeat the agent's
+// own value (legit jobs from the UI or a provider-connection scope do) but
+// can never change it, since a different mount or a "../" prefix reaches
+// another team's secrets (AGT-N-01). Any key outside this set is refused.
 var vaultPayloadAllowlist = map[string]struct{}{
 	vault.ConfigKVMount:  {},
 	vault.ConfigKVPrefix: {},
@@ -100,10 +105,10 @@ const (
 // VaultResolver implements ProviderResolver for providerType="vault".
 //
 // Connection identity (address, namespace, auth method, kubernetes
-// role/mount/token path) comes ONLY from agent env vars (SB_VAULT_*).
-// The job payload may carry ONLY the KV routing keys in
-// vaultPayloadAllowlist (kvMount/kvPrefix). Any other payload key —
-// including any connection-steering key or the token literal — is
+// role/mount/token path) and the KV layout (mount, prefix) come ONLY from
+// agent env vars (SB_VAULT_*). The job payload may carry kvMount/kvPrefix
+// only as an echo of those pinned values (AGT-N-01). Any other payload
+// key — including any connection-steering key or the token literal — is
 // refused (AGT-01).
 //
 // Auth selection (driven entirely by the PINNED env config):
@@ -137,16 +142,22 @@ func mergeVaultConfig(payload map[string]any) (providers.Config, error) {
 	setIfEnv(vault.ConfigAddress, EnvVaultAddr)
 	setIfEnv(vault.ConfigToken, EnvVaultToken)
 	setIfEnv(vault.ConfigNamespace, EnvVaultNamespace)
-	setIfEnv(vault.ConfigKVMount, EnvVaultKVMount)
-	setIfEnv(vault.ConfigKVPrefix, EnvVaultKVPrefix)
 	setIfEnv(vault.ConfigKubernetesRole, EnvVaultKubernetesRole)
 	setIfEnv(vault.ConfigKubernetesMountPath, EnvVaultKubernetesMountPath)
 
-	// Validate + apply the payload. Only the vetted, non-identity keys
-	// in vaultPayloadAllowlist are accepted (they may override the env
-	// KV-layout fallbacks); credential literals and connection-steering
-	// keys are refused, and anything unrecognised is refused too so a
-	// new steering key added to core can't silently pass through.
+	// KV layout: pinned from env too (AGT-N-01). The mount is always set
+	// explicitly so "unset" means core's default mount, not "whatever a
+	// payload names".
+	out[vault.ConfigKVMount] = pinnedVaultKVMount()
+	if prefix := pinnedVaultKVPrefix(); prefix != "" {
+		out[vault.ConfigKVPrefix] = prefix
+	}
+
+	// Validate the payload. The keys in vaultPayloadAllowlist are accepted
+	// only when they echo the pinned value, so they never change the
+	// resolved config; credential literals and connection-steering keys
+	// are refused, and anything unrecognised is refused too so a new
+	// steering key added to core can't silently pass through.
 	for k, v := range payload {
 		switch {
 		case k == vault.ConfigToken:
@@ -154,7 +165,9 @@ func mergeVaultConfig(payload map[string]any) (providers.Config, error) {
 		case isKey(vaultSteeringKeys, k):
 			return nil, fmt.Errorf("vault: connection-steering key %q MUST NOT be passed via job payload (pinned from agent env)", k)
 		case isKey(vaultPayloadAllowlist, k):
-			out[k] = v
+			if err := requireVaultKVEcho(k, v); err != nil {
+				return nil, err
+			}
 		default:
 			return nil, fmt.Errorf("vault: key %q is not accepted in the job payload", k)
 		}
@@ -199,8 +212,9 @@ func hasKey(c providers.Config, k string) bool {
 //
 // Connection identity (region, endpoint, roleArn) comes ONLY from agent
 // env vars (SB_AWS_*). The job payload may carry ONLY the narrowing
-// ListMetadata tagFilter (awsPayloadAllowlist); any other key —
-// credential, connection-steering, or unrecognised — is refused (AGT-01).
+// ListMetadata tagFilter, which is ANDed with SB_AWS_TAG_FILTER
+// (AGT-N-03); any other key — credential, connection-steering, or
+// unrecognised — is refused (AGT-01).
 //
 // Credentials are NEVER passed via this resolver: the underlying
 // core/providers/awssecretsmanager provider relies on the AWS SDK's
@@ -242,15 +256,13 @@ var awsSteeringKeys = map[string]struct{}{
 	awssecretsmanager.ConfigEndpoint: {},
 }
 
-// awsPayloadAllowlist are the ONLY keys a job payload may carry for the
-// aws-sm resolver. tagFilter is a ListMetadata NARROWING filter (used by
-// admin-enqueued discover jobs), not connection identity — it selects
-// which secrets are visible, not where/as-whom the agent connects. Every
-// other payload key — credential, steering, or unrecognised — is refused.
-var awsPayloadAllowlist = map[string]struct{}{
-	awssecretsmanager.ConfigTagFilter: {},
-}
-
+// mergeAWSConfig builds the aws-sm config from agent env plus the job
+// payload. The ONLY key a payload may carry is tagFilter: a ListMetadata
+// NARROWING filter (used by admin-enqueued discover jobs), not connection
+// identity. It selects which secrets are visible, not where/as-whom the
+// agent connects, and it is merged with SB_AWS_TAG_FILTER (see
+// mergeTagFilters), never substituted for it. Every other payload key —
+// credential, steering, or unrecognised — is refused.
 func mergeAWSConfig(payload map[string]any) (providers.Config, error) {
 	out := providers.Config{}
 
@@ -266,36 +278,86 @@ func mergeAWSConfig(payload map[string]any) (providers.Config, error) {
 	// SB_AWS_TAG_FILTER is JSON-encoded (e.g.
 	// `{"EnvironmentName":"tenant-a-uat"}`). Parse loudly so a typo
 	// in chart values doesn't silently disable the safety net.
+	var envFilter map[string]string
 	if raw := os.Getenv(EnvAWSTagFilter); raw != "" {
-		var parsed map[string]string
-		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		if err := json.Unmarshal([]byte(raw), &envFilter); err != nil {
 			return nil, fmt.Errorf("aws-sm: %s must be a JSON object of {tag: value} pairs: %w", EnvAWSTagFilter, err)
-		}
-		if len(parsed) > 0 {
-			out[awssecretsmanager.ConfigTagFilter] = parsed
 		}
 	}
 
-	// Validate + apply the payload. Only the vetted, non-identity keys in
-	// awsPayloadAllowlist are accepted; credential literals and
-	// connection-steering keys are refused, and anything unrecognised is
-	// refused too so a new steering key added to core can't silently pass
-	// through (AGT-01).
+	// Validate the payload. Only the narrowing tagFilter is accepted;
+	// credential literals and connection-steering keys are refused, and
+	// anything unrecognised is refused too so a new steering key added to
+	// core can't silently pass through (AGT-01).
+	var payloadFilter map[string]string
 	for k, v := range payload {
 		switch {
 		case isKey(awsCredentialKeys, k):
 			return nil, fmt.Errorf("aws-sm: %q MUST NOT be passed via job payload (use SDK credential chain)", k)
 		case isKey(awsSteeringKeys, k):
 			return nil, fmt.Errorf("aws-sm: connection-steering key %q MUST NOT be passed via job payload (pinned from agent env)", k)
-		case isKey(awsPayloadAllowlist, k):
-			out[k] = v
+		case k == awssecretsmanager.ConfigTagFilter:
+			pf, err := payloadTagFilter(v)
+			if err != nil {
+				return nil, err
+			}
+			payloadFilter = pf
 		default:
 			return nil, fmt.Errorf("aws-sm: key %q is not accepted in the job payload", k)
 		}
 	}
 
+	merged, err := mergeTagFilters(envFilter, payloadFilter)
+	if err != nil {
+		return nil, err
+	}
+	if len(merged) > 0 {
+		out[awssecretsmanager.ConfigTagFilter] = merged
+	}
+
 	if !hasKey(out, awssecretsmanager.ConfigRegion) {
 		return nil, errors.New("aws-sm: region not configured — set SB_AWS_REGION")
+	}
+	return out, nil
+}
+
+// payloadTagFilter reads a job payload's tagFilter: a JSON object of
+// string tag values. Anything else fails the job rather than being
+// silently ignored.
+func payloadTagFilter(v any) (map[string]string, error) {
+	switch m := v.(type) {
+	case map[string]string:
+		return m, nil
+	case map[string]any:
+		out := make(map[string]string, len(m))
+		for k, raw := range m {
+			s, ok := raw.(string)
+			if !ok {
+				return nil, fmt.Errorf("aws-sm: payload tagFilter value for tag %q must be a string", k)
+			}
+			out[k] = s
+		}
+		return out, nil
+	default:
+		return nil, errors.New("aws-sm: payload tagFilter must be a JSON object of {tag: value} pairs")
+	}
+}
+
+// mergeTagFilters ANDs the agent's SB_AWS_TAG_FILTER with a job payload's
+// tagFilter (AGT-N-03). The payload can only add constraints: every env
+// tag survives, an empty payload map clears nothing, and a payload that
+// names an env tag with a different value fails the job instead of
+// quietly replacing the operator's boundary.
+func mergeTagFilters(env, payload map[string]string) (map[string]string, error) {
+	out := make(map[string]string, len(env)+len(payload))
+	for k, v := range env {
+		out[k] = v
+	}
+	for k, v := range payload {
+		if ev, ok := env[k]; ok && ev != v {
+			return nil, fmt.Errorf("aws-sm: payload tagFilter conflicts with %s on tag %q; a job can narrow the agent's tag filter, not change it", EnvAWSTagFilter, k)
+		}
+		out[k] = v
 	}
 	return out, nil
 }

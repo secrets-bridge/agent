@@ -96,7 +96,7 @@ func (c *Client) Enroll(ctx context.Context, in EnrollRequest) (*EnrollResult, e
 	switch {
 	case resp.StatusCode == http.StatusCreated:
 		var out EnrollResult
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		if err := decodeJSON(resp.Body, maxSmallResponse, &out); err != nil {
 			return nil, fmt.Errorf("client: decode enroll response: %w", err)
 		}
 		if out.AgentID == "" || out.AgentToken == "" {
@@ -118,7 +118,7 @@ func (c *Client) Enroll(ctx context.Context, in EnrollRequest) (*EnrollResult, e
 // echoes anything token-shaped.
 func enrollReason(r io.Reader) string {
 	var body enrollErrorBody
-	if err := json.NewDecoder(r).Decode(&body); err == nil && body.Error != "" {
+	if err := decodeJSON(r, maxSmallResponse, &body); err == nil && body.Error != "" {
 		return body.Error
 	}
 	return "enrollment_rejected"

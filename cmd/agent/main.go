@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -82,28 +83,20 @@ type Config struct {
 
 // Env var names for credential material.
 const (
-	envAgentID     = "SB_AGENT_ID"
-	envAgentSecret = "SB_AGENT_SECRET"
+	envAgentID         = "SB_AGENT_ID"
+	envAgentSecret     = "SB_AGENT_SECRET"
+	envEnrollmentToken = "SB_ENROLLMENT_TOKEN"
 )
 
-// sealingDecision decides, from the keypair source and the SetPublicKey
-// registration result, whether wire-envelope sealing is active and whether
-// a registration failure is fatal (AGT-02).
-//
-//   - registration succeeded          → sealing active, not fatal
-//   - failed, ephemeral keypair (dev)  → sealing inactive, not fatal
-//     (legacy plaintext-over-TLS fallback; the CP has no key for us)
-//   - failed, persistent keypair       → fatal — refuse to run in a
-//     downgradeable state
-func sealingDecision(source identity.KeyPairSource, regErr error) (sealActive, fatal bool) {
-	if regErr == nil {
-		return true, false
-	}
-	if source == identity.KeyPairSourceEphemeral {
-		return false, false
-	}
-	return false, true
+// retryBackoff is an exponential backoff between attempts, capped at max.
+type retryBackoff struct {
+	initial time.Duration
+	max     time.Duration
 }
+
+// pubKeyRetry paces public-key registration retries at boot. A variable so
+// tests can shrink it.
+var pubKeyRetry = retryBackoff{initial: time.Second, max: time.Minute}
 
 func main() {
 	cfg := loadConfig()
@@ -112,7 +105,7 @@ func main() {
 
 	logger.Info("starting secrets-bridge agent",
 		"version", buildVersion,
-		"cp_endpoint", cfg.CPEndpoint,
+		"cp_endpoint", redactEndpoint(cfg.CPEndpoint),
 		"identity_file", cfg.IdentityFile,
 		"local_addr", cfg.LocalAddr,
 		"heartbeat_interval", cfg.HeartbeatInterval,
@@ -130,7 +123,7 @@ func main() {
 	}
 	if cfg.InsecureTransport {
 		logger.Warn("SB_INSECURE_TRANSPORT=true — plaintext over the wire; do NOT use in production",
-			"endpoint", endpointURL.Redacted())
+			"endpoint", redactEndpoint(endpointURL.String()))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -173,81 +166,10 @@ func main() {
 	}
 	logger.Info("identity ready", "source", string(src), "agent_id", id.AgentID)
 
-	// Register the public key with the CP so future GetWrap responses
-	// come SEALED. Idempotent — CP no-ops if we already have this key.
-	//
-	// AGT-02 (no silent downgrade): what happens on failure depends on
-	// the keypair source.
-	//   - Persistent keypair (env/file): the operator provisioned a
-	//     durable key and expects sealed responses. A failed registration
-	//     is FATAL — running would mean either a plaintext downgrade or a
-	//     failing wrap fetch on every job. Fail fast.
-	//   - Ephemeral keypair (dev only): keep the legacy fallback. WARN and
-	//     continue, but do NOT thread the keypair into the executors so
-	//     wrap fetches use the plaintext-over-TLS path (the CP has no key
-	//     for us) instead of tripping the downgrade guard.
-	regErr := httpClient.SetPublicKey(ctx, id.AgentID, id.AgentSecret, kp.Public, "x25519")
-	sealActive, fatal := sealingDecision(kp.Source, regErr)
-	switch {
-	case regErr == nil:
-		logger.Info("public key registered with CP — sealed wire-envelope active")
-	case fatal:
-		logger.Error("public-key registration failed with a PERSISTENT keypair — refusing to run in a downgradeable state (AGT-02); fix CP connectivity, or use an ephemeral keypair (unset SB_AGENT_PRIVATE_KEY[_FILE]) for dev",
-			"error", regErr)
-		os.Exit(1)
-	default:
-		logger.Warn("public-key registration failed — ephemeral keypair, falling back to plaintext-over-TLS",
-			"error", regErr)
-	}
-
-	// Thread the keypair into the executors ONLY when sealing is active
-	// (registration succeeded). A nil keypair keeps the executors on the
-	// legacy path AND stops GetWrap's downgrade guard from rejecting the
-	// CP's (expected) plaintext responses in that mode (AGT-02).
-	var sealPub, sealPriv []byte
-	if sealActive {
-		sealPub, sealPriv = kp.Public, kp.Private
-	}
-
-	// PatchExecutor wires the wrap-fetch client + the dispatching
-	// provider resolver. ResolverByType registers each provider kind
-	// that's compiled in (vault today; aws-sm + others land as they're
-	// implemented). Unknown providerType values fall through to
-	// NotConfiguredResolver so the job fails loud.
-	patch := executor.PatchExecutor{
-		AgentID:         id.AgentID,
-		AgentSecret:     id.AgentSecret,
-		AgentPublicKey:  sealPub,
-		AgentPrivateKey: sealPriv,
-		Client:          httpClient,
-		ResolveProvider: executor.ResolverByType(ctx),
-	}
-	discover := executor.DiscoverExecutor{
-		AgentID:         id.AgentID,
-		AgentSecret:     id.AgentSecret,
-		ClusterName:     cfg.ClusterName,
-		Client:          httpClient,
-		ResolveProvider: executor.ResolverByType(ctx),
-	}
-	read := executor.ReadExecutor{
-		AgentID:         id.AgentID,
-		AgentSecret:     id.AgentSecret,
-		AgentPublicKey:  sealPub,
-		AgentPrivateKey: sealPriv,
-		Client:          httpClient,
-		ResolveProvider: executor.ResolverByType(ctx),
-	}
-	exec := executor.Router{
-		ByType: map[string]executor.Executor{
-			"patch":    patch,
-			"read":     read,
-			"discover": discover,
-		},
-		Default: executor.NoOp{},
-	}
-
+	// Probes come up before registration so liveness passes while the
+	// agent waits for the CP; readiness stays false until run() has a
+	// registered key and starts claiming.
 	probes := local.NewProbes()
-	probes.SetReady(true)
 	localServer := local.NewServer(cfg.LocalAddr, probes, logger)
 	go func() {
 		if err := localServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -255,20 +177,139 @@ func main() {
 		}
 	}()
 
-	// Two loops share the same ctx so SIGTERM cancels both. WaitGroup
-	// blocks main from exiting until both have drained.
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); heartbeatLoop(ctx, logger, cfg, httpClient, id) }()
-	go func() { defer wg.Done(); claimLoop(ctx, logger, cfg, httpClient, exec, id) }()
-
-	wg.Wait()
-	logger.Info("loops drained; shutting down local server")
+	runErr := run(ctx, logger, cfg, httpClient, id, kp, executor.ResolverByType(ctx), probes)
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
 	defer cancel()
 	_ = localServer.Shutdown(shutdownCtx)
+	if runErr != nil && ctx.Err() == nil {
+		logger.Error("agent stopped before it could claim jobs", "error", runErr)
+		cancel()
+		os.Exit(1)
+	}
 	logger.Info("shutdown complete")
+}
+
+// run takes over once the agent has a credential and a keypair.
+//
+// AGT-02 (no unsealed fallback): it first blocks until the CP has accepted
+// the agent's public key, retrying with backoff. No heartbeat is sent and
+// no job is claimed before that. The executors are then always built with
+// the keypair, so values move sealed or not at all; there is no mode where
+// a failed registration leaves the agent running on plaintext over TLS.
+// The keypair source (env, file or ephemeral) no longer changes this.
+//
+// After registration it marks the agent ready and runs the heartbeat and
+// claim loops until ctx ends. It returns an error only when registration
+// could not complete (ctx ended, or the CP rejected the credential).
+func run(ctx context.Context, logger *slog.Logger, cfg Config, c *client.Client, id identity.Identity, kp *identity.KeyPair, resolve executor.ProviderResolver, probes *local.Probes) error {
+	if err := registerPublicKey(ctx, logger, c, id, kp.Public, pubKeyRetry); err != nil {
+		return err
+	}
+	logger.Info("public key registered with CP — sealed wire-envelope active")
+
+	exec := newRouter(cfg, c, id, kp, resolve)
+	probes.SetReady(true)
+
+	// Two loops share the same ctx so SIGTERM cancels both. WaitGroup
+	// blocks until both have drained.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); heartbeatLoop(ctx, logger, cfg, c, id) }()
+	go func() { defer wg.Done(); claimLoop(ctx, logger, cfg, c, exec, id) }()
+	wg.Wait()
+	probes.SetReady(false)
+	logger.Info("loops drained")
+	return nil
+}
+
+// registerPublicKey PUTs the agent's X25519 public key until the CP
+// accepts it. Transient failures (network, 5xx, 404 from a CP that is
+// still rolling out) are retried with exponential backoff; a 401 means
+// the credential is revoked or wrong and is returned at once, as are
+// ctx cancellation and shutdown.
+func registerPublicKey(ctx context.Context, logger *slog.Logger, c *client.Client, id identity.Identity, pub []byte, b retryBackoff) error {
+	delay := b.initial
+	for attempt := 1; ; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := c.SetPublicKey(callCtx, id.AgentID, id.AgentSecret, pub, "x25519")
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, client.ErrUnauthorized) {
+			return fmt.Errorf("public-key registration rejected: %w", err)
+		}
+		logger.Warn("public-key registration failed; no job will be claimed until it succeeds",
+			"attempt", attempt, "retry_in", delay.String(), "error", err)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("public-key registration did not complete: %w", ctx.Err())
+		case <-timer.C:
+		}
+		delay = min(delay*2, b.max)
+	}
+}
+
+// newRouter wires the per-type executors. Every executor that moves a
+// value gets the registered keypair; job types not listed here fail as
+// unsupported (AGT-N-06).
+func newRouter(cfg Config, c *client.Client, id identity.Identity, kp *identity.KeyPair, resolve executor.ProviderResolver) executor.Router {
+	return executor.Router{
+		ByType: map[string]executor.Executor{
+			"patch": executor.PatchExecutor{
+				AgentID:         id.AgentID,
+				AgentSecret:     id.AgentSecret,
+				AgentPublicKey:  kp.Public,
+				AgentPrivateKey: kp.Private,
+				Client:          c,
+				ResolveProvider: resolve,
+			},
+			"read": executor.ReadExecutor{
+				AgentID:         id.AgentID,
+				AgentSecret:     id.AgentSecret,
+				AgentPublicKey:  kp.Public,
+				AgentPrivateKey: kp.Private,
+				Client:          c,
+				ResolveProvider: resolve,
+			},
+			"discover": executor.DiscoverExecutor{
+				AgentID:         id.AgentID,
+				AgentSecret:     id.AgentSecret,
+				ClusterName:     cfg.ClusterName,
+				Client:          c,
+				ResolveProvider: resolve,
+			},
+		},
+	}
+}
+
+// redactEndpoint returns the CP endpoint for logging with userinfo, query
+// and fragment removed, so credentials embedded in SB_CP_ENDPOINT never
+// reach the logs (AGT-N-08).
+func redactEndpoint(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable endpoint>"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.String()
+}
+
+// scrubEnrollmentToken drops the one-time enrollment token from cfg and
+// from the process environment once identity resolution is done, so
+// nothing later in the process (or a child it might start) can read it
+// (AGT-N-08). It can't clear /proc/<pid>/environ or a --enrollment-token
+// flag in argv; the token is single-use, which is the real protection.
+func scrubEnrollmentToken(cfg *Config) {
+	cfg.EnrollmentToken = ""
+	_ = os.Unsetenv(envEnrollmentToken)
 }
 
 // heartbeatLoop beats the CP at a SERVER-DRIVEN cadence: each heartbeat
@@ -344,8 +385,12 @@ func nextSeconds(res *client.HeartbeatResult) int {
 //  3. Otherwise → fail closed with a safe error.
 //
 // The enrollment token and the returned agent_token are never logged,
-// printed, or wrapped into an error.
+// printed, or wrapped into an error, and the token is scrubbed from cfg
+// and the process env before this returns.
 func resolveIdentity(ctx context.Context, cfg *Config, c *client.Client, logger *slog.Logger) (identity.Identity, identity.Source, error) {
+	// The token is needed at most once, below. Drop it on every exit path.
+	defer scrubEnrollmentToken(cfg)
+
 	id, src, err := identity.LoadStored(envAgentID, envAgentSecret, cfg.IdentityFile)
 	switch {
 	case err == nil:
@@ -481,6 +526,14 @@ func claimOne(ctx context.Context, logger *slog.Logger, c *client.Client, exec e
 	go func() {
 		defer inflight.Done()
 		defer func() { <-sem }()
+		// Backstop: processJob already turns an executor panic into a
+		// failed outcome; anything else that panics here must not take
+		// the whole agent down either. Never log the panic value.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("job goroutine panicked", "job_id", job.ID, "panic_type", fmt.Sprintf("%T", r))
+			}
+		}()
 		processJob(ctx, logger, c, exec, id, job)
 	}()
 }
@@ -501,7 +554,7 @@ func processJob(parentCtx context.Context, logger *slog.Logger, c *client.Client
 	execCtx, cancel := claimBoundedContext(parentCtx, job, 60*time.Second)
 	defer cancel()
 
-	outcome := exec.Execute(execCtx, job)
+	outcome := executeSafely(execCtx, logger, exec, job)
 
 	completeCtx, ccancel := context.WithTimeout(parentCtx, 10*time.Second)
 	defer ccancel()
@@ -525,6 +578,25 @@ func processJob(parentCtx context.Context, logger *slog.Logger, c *client.Client
 		"job_id", job.ID,
 		"outcome", outcome.Status,
 	)
+}
+
+// executeSafely runs the executor and turns a panic into a failed outcome
+// (AGT-N-05): one malformed job must not kill the agent and every job it
+// has in flight. The panic value is never logged or sent to the CP since
+// it can carry provider responses or plaintext; only its Go type is
+// logged. Deferred zeroing inside the executor still runs while the panic
+// unwinds.
+func executeSafely(ctx context.Context, logger *slog.Logger, exec executor.Executor, job *client.Job) (outcome client.JobOutcome) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("executor panicked; reporting the job as failed",
+				"job_id", job.ID,
+				"job_type", job.JobType,
+				"panic_type", fmt.Sprintf("%T", r))
+			outcome = client.JobOutcome{Status: client.StatusFailed, Error: "agent: executor panicked; details withheld"}
+		}
+	}()
+	return exec.Execute(ctx, job)
 }
 
 // claimBoundedContext returns a context that expires at the earliest of

@@ -3,22 +3,22 @@
 // ReadExecutor turns a claimed `read`-type job into one wrap per
 // requested key on the CP. Flow:
 //
-//   1. Parse payload to extract request_id + target provider info +
-//      target_keys (which keys the requester wants to see).
-//   2. Resolve provider via the same ResolverByType that backs the
-//      patch + discover flows.
-//   3. provider.GetValue(ref) → SecretValue (JSON-encoded bundle).
-//   4. Unmarshal the bundle into map[string]any. If target_keys is
-//      empty, the agent sends one wrap per key in the bundle; if
-//      non-empty, only the requested keys (skipping any that are
-//      missing — the audit trail captures the omission).
-//   5. For each selected key: base64-encode the value bytes and
-//      client.PostWrap(...) the wrap to the CP. The CP envelope-
-//      encrypts via the KMS layer and persists.
-//   6. Plaintext is zeroed promptly after each POST.
-//   7. Mark job complete (the existing claim/complete loop handles
-//      this around the executor — Execute just returns succeeded /
-//      failed).
+//  1. Parse payload to extract request_id + target provider info +
+//     target_keys (which keys the requester wants to see).
+//  2. Resolve provider via the same ResolverByType that backs the
+//     patch + discover flows.
+//  3. provider.GetValue(ref) → SecretValue (JSON-encoded bundle).
+//  4. Unmarshal the bundle into map[string]any. If target_keys is
+//     empty, the agent sends one wrap per key in the bundle; if
+//     non-empty, only the requested keys (skipping any that are
+//     missing — the audit trail captures the omission).
+//  5. For each selected key: client.PostWrap(...) encrypts the value
+//     locally under a fresh CP-issued DEK and posts only the envelope
+//     (Piece 8b). There is no plaintext-over-TLS path (AGT-02).
+//  6. Plaintext is zeroed promptly after each POST.
+//  7. Mark job complete (the existing claim/complete loop handles
+//     this around the executor — Execute just returns succeeded /
+//     failed).
 //
 // Hard rules:
 //   - Plaintext never logged
@@ -41,25 +41,23 @@ import (
 )
 
 // PostWrapClient is the slice of *client.Client the ReadExecutor
-// needs. Defined here so unit tests can swap in a fake.
-//
-// useEnvelope toggles the wire-envelope path (Piece 8b): true → agent
-// calls /dek and AES-GCM-encrypts locally before POST; false → legacy
-// base64 plaintext over TLS.
+// needs. Defined here so unit tests can swap in a fake. PostWrap always
+// sends the wire envelope (DEK from /dek, AES-GCM locally); it has no
+// plaintext mode.
 type PostWrapClient interface {
-	PostWrap(ctx context.Context, agentID, agentSecret, requestID, keyName string, plaintext []byte, useEnvelope bool) (*client.PostWrapResponse, error)
+	PostWrap(ctx context.Context, agentID, agentSecret, requestID, keyName string, plaintext []byte) (*client.PostWrapResponse, error)
 }
 
 // ReadExecutor implements Executor for job_type=read jobs.
 //
-// When AgentPublicKey is non-empty the executor sends the wire-envelope
-// shape on PostWrap (Piece 8b). When nil it falls back to the legacy
-// base64-over-TLS path so an agent that pre-dates wire-envelope keeps
-// working unchanged.
+// AgentPublicKey/AgentPrivateKey are the keypair the agent registered with
+// the CP. Main only wires them after registration succeeded, so an empty
+// keypair means sealing is not active and the executor refuses the job
+// instead of moving a value (AGT-02).
 type ReadExecutor struct {
 	AgentID         string
 	AgentSecret     string
-	AgentPublicKey  []byte // nil = legacy plaintext-over-TLS path
+	AgentPublicKey  []byte
 	AgentPrivateKey []byte
 	Client          PostWrapClient
 	ResolveProvider ProviderResolver
@@ -69,6 +67,12 @@ type ReadExecutor struct {
 func (r ReadExecutor) Execute(ctx context.Context, job *client.Job) client.JobOutcome {
 	payload, err := parseReadPayload(job.Payload)
 	if err != nil {
+		return fail("payload: " + err.Error())
+	}
+	if !sealingReady(r.AgentPublicKey, r.AgentPrivateKey) {
+		return fail(errSealingNotActive)
+	}
+	if err := checkSecretRef(payload.TargetProviderType, payload.TargetSecretRef); err != nil {
 		return fail("payload: " + err.Error())
 	}
 
@@ -108,7 +112,6 @@ func (r ReadExecutor) Execute(ctx context.Context, job *client.Job) client.JobOu
 		}
 	}
 
-	useEnvelope := len(r.AgentPublicKey) > 0 && len(r.AgentPrivateKey) > 0
 	posted := 0
 	missing := []string{}
 	for _, key := range wantKeys {
@@ -119,7 +122,7 @@ func (r ReadExecutor) Execute(ctx context.Context, job *client.Job) client.JobOu
 		}
 		plain := bytesFromBundleValue(raw)
 		_, err := r.Client.PostWrap(ctx, r.AgentID, r.AgentSecret,
-			payload.RequestID, key, plain, useEnvelope)
+			payload.RequestID, key, plain)
 		client.Zero(plain)
 		if err != nil {
 			return fail(fmt.Sprintf("post wrap key=%q (after %d posted, %d missing): %v",
