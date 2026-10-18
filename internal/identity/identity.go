@@ -186,9 +186,10 @@ func loadFromFile(path string) (Identity, error) {
 // one is a few hundred bytes of JSON.
 const maxIdentityFileSize = 64 << 10
 
-// tightenFileMode drops permission bits on an open identity file. It is a
-// variable only so tests can simulate a file whose mode can't be changed
-// (a read-only Secret mount, a file owned by another user).
+// tightenFileMode drops permission bits on an open identity or private
+// key file. It is a variable only so tests can simulate a file whose mode
+// can't be changed (a read-only Secret mount, a file owned by another
+// user).
 var tightenFileMode = func(f *os.File, mode os.FileMode) error { return f.Chmod(mode) }
 
 // readCredentialFile reads the identity file, which holds the agent's

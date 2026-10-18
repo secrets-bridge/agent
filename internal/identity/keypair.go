@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -103,21 +104,38 @@ func LoadOrGenerateKeyPair(envKey, envKeyFile string) (*KeyPair, error) {
 // loadKeyFile reads an existing 32-byte private key file. A missing file
 // comes back as an error matching os.ErrNotExist.
 func loadKeyFile(envKeyFile, path string) (*KeyPair, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
 		return nil, fmt.Errorf("identity: read %s: %w", path, err)
 	}
+	defer func() { _ = f.Close() }()
+
 	// AGT-04: a private key file must not be readable by group or
-	// other. Warn (rather than refuse) so a K8s Secret volume that
-	// defaults to mode 0644 doesn't hard-fail the agent; operators
-	// can tighten the file mode or set the volume defaultMode.
-	if info, statErr := os.Stat(path); statErr == nil && keyFileModeTooOpen(info.Mode()) {
-		slog.Warn("agent private key file is group/other-accessible; tighten to 0600 (or set the Secret volume defaultMode to 0400)",
-			"path", path,
-			"mode", fmt.Sprintf("%#o", info.Mode().Perm()))
+	// other. The agent drops those bits on the open file, as it does for
+	// the identity file: kubelet re-adds group bits to every file on a
+	// volume when the pod sets fsGroup. Where the mode can't change (a
+	// read-only Secret volume, a file owned by someone else) it warns
+	// rather than refuses, so a Secret volume defaulting to 0644 doesn't
+	// hard-fail the agent; operators can set the volume defaultMode.
+	if info, statErr := f.Stat(); statErr == nil && keyFileModeTooOpen(info.Mode()) {
+		perm := info.Mode().Perm()
+		if err := tightenFileMode(f, perm&^0o077); err == nil {
+			slog.Warn("agent private key file was group/other-accessible; tightened to owner-only before reading (on Kubernetes, fsGroup re-adds group bits at mount; set fsGroupChangePolicy: OnRootMismatch to stop that)",
+				"path", path,
+				"mode_was", fmt.Sprintf("%#o", perm))
+		} else {
+			slog.Warn("agent private key file is group/other-accessible and could not be tightened; chmod it to 0600 (or set the Secret volume defaultMode to 0400)",
+				"path", path,
+				"mode", fmt.Sprintf("%#o", perm),
+				"error", err)
+		}
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("identity: read %s: %w", path, err)
 	}
 	if len(data) != 32 {
 		return nil, fmt.Errorf("identity: %s file %q must be exactly 32 raw bytes, got %d", envKeyFile, path, len(data))
