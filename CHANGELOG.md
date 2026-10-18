@@ -16,6 +16,21 @@ on `main`.
   pushed to `ghcr.io/secrets-bridge/agent`. Tags: rolling `dev` on
   every push to `main`; semver tags + `latest` activate post-`v0.1.0`.
 
+### Changed
+- Security batch, October 2026:
+  - A job can't widen the agent's scope. A Vault `kvMount` / `kvPrefix`
+    in a payload has to equal `SB_VAULT_KV_MOUNT` / `SB_VAULT_KV_PREFIX`
+    (unset means `kv` and no prefix), connection-steering keys such as
+    `address` or `region` fail the job, and a payload `tagFilter` is
+    ANDed with `SB_AWS_TAG_FILTER` (#24).
+  - No unsealed fallback: `/readyz` stays 503 until the public key is
+    registered. The control-plane client refuses redirects and caps
+    response bodies, and an identity file with world permissions is
+    refused (#24).
+  - core bump (#32): Vault refs with a leading or trailing `/`, empty
+    refs, a discover scope of `/` and any `..` or encoded traversal are
+    refused before a request reaches Vault.
+
 ---
 
 ## How to cut a release (post-v0.1.0)
