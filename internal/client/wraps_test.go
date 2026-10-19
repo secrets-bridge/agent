@@ -369,3 +369,60 @@ func hkdfDeriveForTest(t *testing.T, shared, salt []byte) []byte {
 	}
 	return out
 }
+
+// agent#39 / api#286: an empty value is sealed and posted like any
+// other. The envelope carries a GCM tag that opens to zero bytes.
+func TestPostWrap_EmptyPlaintextIsSealedNormally(t *testing.T) {
+	dekPlain := make([]byte, 32)
+	if _, err := rand.Read(dekPlain); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	var capturedBody []byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/agents/a/dek", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"algorithm":  "aes-256-gcm",
+			"plaintext":  base64.StdEncoding.EncodeToString(dekPlain),
+			"ciphertext": base64.StdEncoding.EncodeToString([]byte("kms-ct")),
+		})
+	})
+	mux.HandleFunc("POST /api/v1/agents/a/wraps", func(w http.ResponseWriter, r *http.Request) {
+		capturedBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"wrap_id":"w","request_id":"r","key_name":"EMPTY","byte_length":0}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := client.New(srv.URL).WithHTTPClient(srv.Client())
+
+	if _, err := c.PostWrap(t.Context(), "a", "s", "r", "EMPTY", []byte{}); err != nil {
+		t.Fatalf("PostWrap(empty): %v", err)
+	}
+	var body client.PostWrapRequest
+	if err := json.Unmarshal(capturedBody, &body); err != nil {
+		t.Fatalf("decode posted body: %v", err)
+	}
+	if body.KeyName != "EMPTY" || body.Envelope == nil || body.Envelope.Algorithm != "aes-256-gcm" {
+		t.Fatalf("not a normal sealed wrap: %s", capturedBody)
+	}
+	ct, _ := base64.StdEncoding.DecodeString(body.Envelope.Ciphertext)
+	nonce, _ := base64.StdEncoding.DecodeString(body.Envelope.Nonce)
+	block, err := aes.NewCipher(dekPlain)
+	if err != nil {
+		t.Fatalf("aes: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("gcm: %v", err)
+	}
+	if len(ct) != gcm.Overhead() {
+		t.Fatalf("ciphertext len = %d want %d (tag only)", len(ct), gcm.Overhead())
+	}
+	pt, err := gcm.Open(nil, nonce, ct, nil)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if len(pt) != 0 {
+		t.Fatalf("opened %d bytes want 0", len(pt))
+	}
+}
