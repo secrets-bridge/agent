@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -138,6 +139,26 @@ func TestCompleteJob_SerializesErrorField(t *testing.T) {
 	}
 	if gotBody["error"] != "provider denied" {
 		t.Fatalf("error field not serialized: %+v", gotBody)
+	}
+}
+
+// LogAttrs is local log context only; it never goes to the CP.
+func TestCompleteJob_DoesNotSendLogAttrs(t *testing.T) {
+	gotBody := map[string]any{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := client.New(srv.URL)
+	out := client.JobOutcome{Status: client.StatusFailed, Error: "x",
+		LogAttrs: []slog.Attr{slog.String("key", "K"), slog.Int("posted", 1)}}
+	if err := c.CompleteJob(context.Background(), "a", "s", "j", out); err != nil {
+		t.Fatalf("CompleteJob: %v", err)
+	}
+	if len(gotBody) != 2 || gotBody["status"] != "failed" || gotBody["error"] != "x" {
+		t.Fatalf("unexpected body: %+v", gotBody)
 	}
 }
 

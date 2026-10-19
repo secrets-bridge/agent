@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -27,9 +28,14 @@ type Job struct {
 // JobOutcome is the body of the complete request. Status is one of
 // "succeeded" / "failed"; Error carries operator-visible context on
 // failure.
+//
+// LogAttrs is local-only context for the agent's own failure log line
+// (key names and counts). It is never sent to the CP and must never
+// carry a value, plaintext or ciphertext.
 type JobOutcome struct {
-	Status string `json:"status"`
-	Error  string `json:"error,omitempty"`
+	Status   string      `json:"status"`
+	Error    string      `json:"error,omitempty"`
+	LogAttrs []slog.Attr `json:"-"`
 }
 
 const (

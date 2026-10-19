@@ -35,6 +35,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 
 	"github.com/secrets-bridge/agent/internal/client"
 	"github.com/secrets-bridge/core/providers"
@@ -112,33 +114,82 @@ func (r ReadExecutor) Execute(ctx context.Context, job *client.Job) client.JobOu
 		}
 	}
 
+	// Count missing keys up front (key names only, no values) so a
+	// failure reports complete counts.
+	total := len(wantKeys)
+	missing := 0
+	for _, key := range wantKeys {
+		if _, ok := bundle[key]; !ok {
+			missing++
+		}
+	}
+
+	// One failing key fails the whole job: a reveal that silently
+	// leaves out keys would mislead the requester. Empty values are
+	// not special: they are sealed and posted like any other value.
 	posted := 0
-	missing := []string{}
 	for _, key := range wantKeys {
 		raw, ok := bundle[key]
 		if !ok {
-			missing = append(missing, key)
 			continue
 		}
 		plain := bytesFromBundleValue(raw)
 		_, err := r.Client.PostWrap(ctx, r.AgentID, r.AgentSecret,
 			payload.RequestID, key, plain)
-		client.Zero(plain)
 		if err != nil {
-			return fail(fmt.Sprintf("post wrap key=%q (after %d posted, %d missing): %v",
-				key, posted, len(missing), err))
+			reason := redactValue(err.Error(), plain)
+			client.Zero(plain)
+			out := fail(fmt.Sprintf("post wrap key=%q failed (after %d posted, %d missing, %d total): %s",
+				key, posted, missing, total, reason))
+			out.LogAttrs = readCounts(key, posted, missing, total)
+			return out
 		}
+		client.Zero(plain)
 		posted++
 	}
 
-	if posted == 0 && len(wantKeys) > 0 {
+	if posted == 0 && total > 0 {
 		// Asked for specific keys, none present in the bundle. That's
-		// a failure from the requester's perspective — they expected
+		// a failure from the requester's perspective: they expected
 		// values and got none.
-		return fail(fmt.Sprintf("none of the requested keys exist in bundle (asked %d, missing %d)",
-			len(wantKeys), len(missing)))
+		out := fail(fmt.Sprintf("none of the requested keys exist in bundle (asked %d, missing %d)",
+			total, missing))
+		out.LogAttrs = readCounts("", posted, missing, total)
+		return out
 	}
 	return client.JobOutcome{Status: client.StatusSucceeded}
+}
+
+// readCounts is the local-only log context of a failed read: the key
+// that failed (if any) and the counts. Key names and integers only.
+func readCounts(key string, posted, missing, total int) []slog.Attr {
+	attrs := make([]slog.Attr, 0, 4)
+	if key != "" {
+		attrs = append(attrs, slog.String("key", key))
+	}
+	return append(attrs,
+		slog.Int("posted", posted),
+		slog.Int("missing", missing),
+		slog.Int("total", total))
+}
+
+// minRedactLen is the shortest value redactValue scrubs. Shorter values
+// would match ordinary words in the error text and mangle it.
+const minRedactLen = 4
+
+// redactValue removes the value of the failing key from an error text
+// before it is logged or sent to the CP. The agent posts only
+// ciphertext, so the CP should never echo the value; this is a
+// backstop in case an error body does, raw or JSON-escaped.
+func redactValue(msg string, value []byte) string {
+	if len(value) < minRedactLen {
+		return msg
+	}
+	msg = strings.ReplaceAll(msg, string(value), "[redacted]")
+	if esc, err := json.Marshal(string(value)); err == nil && len(esc) > 2 {
+		msg = strings.ReplaceAll(msg, string(esc[1:len(esc)-1]), "[redacted]")
+	}
+	return msg
 }
 
 // readPayload is the typed view of the JSON in a read job's payload.

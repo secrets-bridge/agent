@@ -555,6 +555,7 @@ func processJob(parentCtx context.Context, logger *slog.Logger, c *client.Client
 	defer cancel()
 
 	outcome := executeSafely(execCtx, logger, exec, job)
+	logFailedJob(parentCtx, logger, job, outcome)
 
 	completeCtx, ccancel := context.WithTimeout(parentCtx, 10*time.Second)
 	defer ccancel()
@@ -578,6 +579,25 @@ func processJob(parentCtx context.Context, logger *slog.Logger, c *client.Client
 		"job_id", job.ID,
 		"outcome", outcome.Status,
 	)
+}
+
+// logFailedJob writes one WARN line for a failed job with the job id,
+// job type and the reason the CP will see, plus the executor's local
+// context (for a read: the failing key and the counts). The reason is
+// built by the executors from key names, counts, status codes and CP or
+// provider error text, never from a value.
+func logFailedJob(ctx context.Context, logger *slog.Logger, job *client.Job, outcome client.JobOutcome) {
+	if outcome.Status != client.StatusFailed {
+		return
+	}
+	attrs := make([]slog.Attr, 0, 4+len(outcome.LogAttrs))
+	attrs = append(attrs,
+		slog.String("job_id", job.ID),
+		slog.String("job_type", job.JobType),
+		slog.String("correlation_id", job.CorrelationID),
+		slog.String("reason", outcome.Error))
+	attrs = append(attrs, outcome.LogAttrs...)
+	logger.LogAttrs(ctx, slog.LevelWarn, "job failed", attrs...)
 }
 
 // executeSafely runs the executor and turns a panic into a failed outcome

@@ -390,3 +390,81 @@ func (c *countingFailingClient) PostWrap(context.Context, string, string, string
 	}
 	return &client.PostWrapResponse{WrapID: "ok"}, nil
 }
+
+// agent#39 / api#286: an empty value is not skipped or refused by the
+// agent. It is posted as a wrap like any other key, and the job
+// succeeds when the CP accepts it.
+func TestReadExecutor_EmptyValuePostedLikeAnyOther(t *testing.T) {
+	provider := &fakeGetProvider{
+		bytes: []byte(`{"A":"x1","EMPTY":"","B":"x2"}`),
+	}
+	wc := &fakePostWrapClient{}
+	exec := executor.ReadExecutor{
+		AgentID: "a", AgentSecret: "s",
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
+		Client:          wc,
+		ResolveProvider: readResolverReturning(provider),
+	}
+	out := exec.Execute(t.Context(), &client.Job{Payload: map[string]any{
+		"request_id":           "req-e",
+		"target_provider_type": "vault",
+		"target_secret_ref":    "secret/data/x",
+		"target_keys":          []any{"A", "EMPTY", "B"},
+	}})
+	if out.Status != client.StatusSucceeded {
+		t.Fatalf("status=%q err=%q", out.Status, out.Error)
+	}
+	if len(wc.calls) != 3 {
+		t.Fatalf("posted %d wraps want 3: %+v", len(wc.calls), wc.calls)
+	}
+	if wc.calls[1].keyName != "EMPTY" || wc.calls[1].plaintext != "" {
+		t.Fatalf("empty key not posted as empty: %+v", wc.calls[1])
+	}
+}
+
+// The outcome of a refused key names the key and the counts, carries
+// them as local log context, and redacts the value if an error body
+// echoes it (raw or JSON-escaped).
+func TestReadExecutor_RefusedKeyReportsCountsAndRedactsValue(t *testing.T) {
+	canary := `can"ary-7c1e`
+	provider := &fakeGetProvider{
+		bytes: []byte(`{"K1":"v1","K2":"can\"ary-7c1e"}`),
+	}
+	wc := &fakePostWrapClient{err: &client.HTTPError{Status: 500,
+		Body: `{"error":"echo ` + canary + ` / can\"ary-7c1e"}`}}
+	exec := executor.ReadExecutor{
+		AgentID: "a", AgentSecret: "s",
+		AgentPublicKey:  make([]byte, 32),
+		AgentPrivateKey: make([]byte, 32),
+		Client:          wc,
+		ResolveProvider: readResolverReturning(provider),
+	}
+	out := exec.Execute(t.Context(), &client.Job{Payload: map[string]any{
+		"request_id":           "req-r",
+		"target_provider_type": "vault",
+		"target_secret_ref":    "secret/data/x",
+		"target_keys":          []any{"K2", "NOPE"},
+	}})
+	if out.Status != client.StatusFailed {
+		t.Fatalf("status=%q", out.Status)
+	}
+	for _, sub := range []string{`key="K2"`, "0 posted", "1 missing", "2 total", "http 500", "[redacted]"} {
+		if !strings.Contains(out.Error, sub) {
+			t.Fatalf("error %q missing %q", out.Error, sub)
+		}
+	}
+	if strings.Contains(out.Error, "ary-7c1e") {
+		t.Fatalf("error leaked the value: %q", out.Error)
+	}
+	got := map[string]string{}
+	for _, a := range out.LogAttrs {
+		got[a.Key] = a.Value.String()
+	}
+	want := map[string]string{"key": "K2", "posted": "0", "missing": "1", "total": "2"}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("LogAttrs[%s] = %q want %q (all: %v)", k, got[k], v, got)
+		}
+	}
+}
