@@ -59,7 +59,7 @@ func NotConfiguredResolver(providerType string, _ map[string]any) (providers.Pro
 
 // PatchExecutor implements Executor for job_type=patch jobs.
 //
-// AgentPublicKey/AgentPrivateKey are the registered keypair used to open
+// AgentPublicKey/AgentPrivateKey are the agent's bound wire key, used to open
 // sealed wraps. An empty keypair means sealing is not active and the job
 // is refused before any wrap is fetched (AGT-02).
 type PatchExecutor struct {
@@ -241,7 +241,7 @@ func fail(msg string) client.JobOutcome {
 // errSealingNotActive is the job error when an executor has no registered
 // keypair. Values only move sealed; without a keypair the job fails rather
 // than falling back to plaintext over TLS (AGT-02).
-const errSealingNotActive = "sealing not active (no registered keypair); refusing to move values unsealed"
+const errSealingNotActive = "sealing not active (no wire key); refusing to move values unsealed"
 
 func sealingReady(pub, priv []byte) bool {
 	return len(pub) > 0 && len(priv) > 0

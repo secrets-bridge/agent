@@ -26,10 +26,21 @@ var ErrUnauthorized = errors.New("client: unauthorized")
 // ErrNotFound maps the CP's 404 response.
 var ErrNotFound = errors.New("client: not found")
 
+// ErrKeyMismatch maps the CP's 409 {"error":"agent_key_mismatch"}: the
+// X-Agent-Key-Fingerprint the agent sent is not the key the CP has bound
+// to it (the key was rotated, or the agent runs with the wrong Secret).
+// It is fatal; the agent must be restarted with the current credentials.
+var ErrKeyMismatch = errors.New("client: agent_key_mismatch: this agent's private key is not the key bound on the control plane")
+
+// headerKeyFingerprint carries the agent's public key fingerprint on every
+// request under /agents/:id/*.
+const headerKeyFingerprint = "X-Agent-Key-Fingerprint"
+
 // Client is a thin HTTP client over the CP API.
 type Client struct {
-	base string
-	hc   *http.Client
+	base        string
+	hc          *http.Client
+	fingerprint string
 }
 
 // New constructs a Client bound to the given Control Plane base URL.
@@ -52,8 +63,43 @@ func (c *Client) WithHTTPClient(hc *http.Client) *Client {
 	return c
 }
 
+// WithKeyFingerprint sets the public key fingerprint sent in
+// X-Agent-Key-Fingerprint on every agent-authenticated request.
+func (c *Client) WithKeyFingerprint(fp string) *Client {
+	c.fingerprint = fp
+	return c
+}
+
+// doAgent sends an agent-authenticated request: it sets X-Agent-Secret and
+// X-Agent-Key-Fingerprint, and turns a 409 agent_key_mismatch into
+// ErrKeyMismatch. Any other 409 is handed back with its body intact so the
+// caller can map it (claim lost, request not approved).
+func (c *Client) doAgent(req *http.Request, agentSecret string) (*http.Response, error) {
+	req.Header.Set("X-Agent-Secret", agentSecret)
+	if c.fingerprint != "" {
+		req.Header.Set(headerKeyFingerprint, c.fingerprint)
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusConflict {
+		return resp, nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSmallResponse))
+	_ = resp.Body.Close()
+	var e struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(body, &e) == nil && e.Error == "agent_key_mismatch" {
+		return nil, ErrKeyMismatch
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp, nil
+}
+
 // HeartbeatReport is the OPTIONAL runtime body an agent may send on a
-// heartbeat (api-2). When nil, the agent sends a bodyless heartbeat and the
+// heartbeat (api-2). Capabilities lists the job types the agent executes. When nil, the agent sends a bodyless heartbeat and the
 // CP replies 204 (the legacy contract, unchanged). When non-nil, the CP
 // records the fields and replies 200 with a HeartbeatResult. It carries NO
 // credential material — the X-Agent-Secret stays in the header.
@@ -91,12 +137,11 @@ func (c *Client) Heartbeat(ctx context.Context, agentID, agentSecret string, rep
 	if err != nil {
 		return nil, fmt.Errorf("client: build heartbeat request: %w", err)
 	}
-	req.Header.Set("X-Agent-Secret", agentSecret)
 	if report != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := c.hc.Do(req)
+	resp, err := c.doAgent(req, agentSecret)
 	if err != nil {
 		return nil, fmt.Errorf("client: heartbeat: %w", err)
 	}

@@ -4,6 +4,10 @@
 # distroless/static so the container has no shell, no package manager,
 # and runs as nonroot. The whole point of the agent is to stay small
 # and trivially deployable inside customer boundaries.
+#
+# With no arguments the image runs the agent. The same binary carries the
+# operator subcommands: `docker run -i --rm <image> enroll ...` and
+# `docker run -i --rm <image> rotate-key ...`.
 
 FROM golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS build
 WORKDIR /src
@@ -18,11 +22,11 @@ RUN CGO_ENABLED=0 GOOS=linux \
     go build \
       -trimpath \
       -ldflags="-s -w -X main.buildVersion=${BUILD_VERSION}" \
-      -o /out/agent \
+      -o /out/secrets-bridge-agent \
       ./cmd/agent
 
 FROM gcr.io/distroless/static:nonroot@sha256:d62067879de890a1def9da0e7766b7d20810a5e5555cef8506b752437d7a3e88
-COPY --from=build /out/agent /usr/local/bin/agent
+COPY --from=build /out/secrets-bridge-agent /usr/local/bin/secrets-bridge-agent
 EXPOSE 8090
 USER nonroot:nonroot
-ENTRYPOINT ["/usr/local/bin/agent"]
+ENTRYPOINT ["/usr/local/bin/secrets-bridge-agent"]

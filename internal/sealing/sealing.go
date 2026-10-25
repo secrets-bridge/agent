@@ -21,6 +21,8 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -125,20 +127,9 @@ func Open(env *Envelope, recipientPriv, recipientPub []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
-// GenerateKeypair returns a fresh X25519 keypair. Used by the agent
-// at startup when no private key has been persisted yet.
-func GenerateKeypair() (pub, priv []byte, err error) {
-	curve := ecdh.X25519()
-	p, err := curve.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, nil, fmt.Errorf("sealing: generate keypair: %w", err)
-	}
-	return p.PublicKey().Bytes(), p.Bytes(), nil
-}
-
 // PublicFromPrivate derives the public key from a stored private key.
-// Used after the agent loads its private key from file / env so it
-// has the public key to send to the CP on registration.
+// The runtime uses it after it reads private_key from the credentials
+// directory, to compute the fingerprint it presents to the CP.
 func PublicFromPrivate(priv []byte) ([]byte, error) {
 	curve := ecdh.X25519()
 	p, err := curve.NewPrivateKey(priv)
@@ -146,6 +137,55 @@ func PublicFromPrivate(priv []byte) ([]byte, error) {
 		return nil, fmt.Errorf("sealing: parse private key: %w", err)
 	}
 	return p.PublicKey().Bytes(), nil
+}
+
+// PublicKeyAlgorithm is the only wire-key algorithm the CP accepts.
+const PublicKeyAlgorithm = "x25519"
+
+// FingerprintPrefix starts every public key fingerprint.
+const FingerprintPrefix = "sha256:"
+
+// Fingerprint returns "sha256:" plus the lowercase hex SHA-256 of the 32
+// raw public key bytes. The CP computes the same value for the key it has
+// bound to the agent; the agent sends it in X-Agent-Key-Fingerprint and
+// compares it with a wrap's recipient_key_fingerprint.
+func Fingerprint(pub []byte) string {
+	sum := sha256.Sum256(pub)
+	return FingerprintPrefix + hex.EncodeToString(sum[:])
+}
+
+// lowOrderProbeScalar is a fixed non-zero X25519 scalar. ValidatePublicKey
+// runs X25519 with it: crypto/ecdh returns an error when the shared secret
+// is all zeros, which is what a low-order point (or the zero key) gives.
+var lowOrderProbeScalar = [32]byte{
+	0x09, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71, 0x82, 0x93, 0xa4, 0xb5, 0xc6, 0xd7, 0xe8, 0xf9,
+	0x0a, 0x1c, 0x2e, 0x30, 0x42, 0x54, 0x66, 0x78, 0x8a, 0x9c, 0xae, 0xb0, 0xc2, 0xd4, 0xe6, 0x48,
+}
+
+// ErrInvalidPublicKey is returned by ValidatePublicKey.
+var ErrInvalidPublicKey = errors.New("sealing: invalid x25519 public key")
+
+// ValidatePublicKey applies the CP's public key rules locally: exactly 32
+// bytes, not all zero and not a low-order point.
+func ValidatePublicKey(pub []byte) error {
+	if len(pub) != x25519KeySize {
+		return fmt.Errorf("%w: want %d bytes, got %d", ErrInvalidPublicKey, x25519KeySize, len(pub))
+	}
+	curve := ecdh.X25519()
+	p, err := curve.NewPublicKey(pub)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidPublicKey, err)
+	}
+	probe, err := curve.NewPrivateKey(lowOrderProbeScalar[:])
+	if err != nil {
+		return fmt.Errorf("sealing: probe scalar: %w", err)
+	}
+	shared, err := probe.ECDH(p)
+	if err != nil {
+		return fmt.Errorf("%w: low-order point", ErrInvalidPublicKey)
+	}
+	Zero(shared)
+	return nil
 }
 
 // EncryptForCP is a small helper for the AES-GCM wire-envelope POST

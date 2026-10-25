@@ -11,6 +11,25 @@ on `main`.
 
 ## [Unreleased]
 
+### Changed
+- Stateless enrollment with a customer-owned key (skills#116, #46). The
+  binary gains `enroll` and `rotate-key` subcommands: the X25519 key is
+  generated on the operator's side, possession is proven with a sealed
+  challenge, and the bundle (`agent_id`, `agent_secret`, `private_key`,
+  `public_key_fingerprint`) goes to a 0600 file or stdout as json, env or
+  a Kubernetes Secret manifest. The runtime reads only the read-only
+  `SB_AGENT_CREDENTIALS_DIR`, refuses files with group write or execute
+  or any other-user bit, sends `X-Agent-Key-Fingerprint` on every call,
+  exits on 401 or 409 `agent_key_mismatch`, and refuses wraps sealed to
+  another key. The heartbeat reports capabilities (#35). The image
+  binary is now `/usr/local/bin/secrets-bridge-agent`.
+
+### Removed
+- Enroll on first boot, `SB_ENROLLMENT_ENABLED`, `SB_ENROLLMENT_TOKEN`,
+  `SB_IDENTITY_FILE` and the identity file writer, `SB_AGENT_ID`,
+  `SB_AGENT_SECRET`, `SB_AGENT_PRIVATE_KEY[_FILE]`, ephemeral and
+  generated-on-boot keys, and the `PUT /agents/:id/public-key` call.
+
 ### Added
 - Docker image publishing workflow — multi-arch (amd64 + arm64),
   pushed to `ghcr.io/secrets-bridge/agent`. Tags: rolling `dev` on

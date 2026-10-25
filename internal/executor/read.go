@@ -52,8 +52,8 @@ type PostWrapClient interface {
 
 // ReadExecutor implements Executor for job_type=read jobs.
 //
-// AgentPublicKey/AgentPrivateKey are the keypair the agent registered with
-// the CP. Main only wires them after registration succeeded, so an empty
+// AgentPublicKey/AgentPrivateKey are the wire key the agent has bound on
+// the CP. Main always wires them from the credentials directory, so an empty
 // keypair means sealing is not active and the executor refuses the job
 // instead of moving a value (AGT-02).
 type ReadExecutor struct {

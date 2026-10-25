@@ -6,87 +6,75 @@
 // listener on a public network interface; the only HTTP server is a
 // loopback /healthz /readyz /metrics endpoint for kubelet + Prometheus.
 //
+// The same binary carries two operator subcommands, enroll and
+// rotate-key (internal/cli), which create the credential bundle. Run with
+// no subcommand it is the agent runtime.
+//
 // Hard rules (BRD §15, §24, NFR-09):
 //   - The agent has NO PostgreSQL, Redis, or any other CP-internal
 //     runtime dependency. CI verifies that go.sum does not contain any
 //     forbidden driver.
-//   - Authentication is via the long-lived agent_secret minted by the
-//     CP. Presented on every heartbeat AND every claim/complete in the
-//     X-Agent-Secret header.
-//   - Credential material lives in either env vars (SB_AGENT_ID +
-//     SB_AGENT_SECRET) or a mounted K8s Secret file. No state is
-//     written to disk by the agent — Pod restart re-reads the Secret.
+//   - The runtime reads agent_id, agent_secret and private_key from a
+//     read-only credentials directory (SB_AGENT_CREDENTIALS_DIR) and
+//     nothing else. It never writes a file, never generates a key and
+//     fails closed when a file is missing, malformed or too open. A
+//     restart re-reads the same files.
+//   - Every CP call carries X-Agent-Secret and X-Agent-Key-Fingerprint.
+//     A 401 (revoked) or 409 agent_key_mismatch (rotated key) stops the
+//     agent with a non-zero exit.
 package main
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/secrets-bridge/agent/internal/cli"
 	"github.com/secrets-bridge/agent/internal/client"
 	"github.com/secrets-bridge/agent/internal/executor"
 	"github.com/secrets-bridge/agent/internal/identity"
 	"github.com/secrets-bridge/agent/internal/local"
 	"github.com/secrets-bridge/agent/internal/observability"
+	"github.com/secrets-bridge/agent/internal/transport"
 )
 
 // buildVersion is set at link time.
 var buildVersion = "dev"
 
+// capabilities are the job types this agent executes, reported on every
+// heartbeat. Keep in step with newRouter.
+var capabilities = []string{"discover", "patch", "read"}
+
 // Config carries the agent's runtime configuration.
 type Config struct {
 	CPEndpoint        string
-	IdentityFile      string
+	CredentialsDir    string
 	LocalAddr         string
 	HeartbeatInterval time.Duration
 	ClaimInterval     time.Duration
 	ClaimConcurrency  int
 	ShutdownGrace     time.Duration
-	// ClusterName identifies this agent's boundary (e.g. "prod-eu",
-	// "uat-archive-account"). Required for discover jobs — the agent
-	// stamps every discovered secret with this name so the CP can
-	// disambiguate the same secret_ref across clusters. Optional for
-	// patch/read jobs (they're scoped via target_secret_ref).
+	// ClusterName identifies this agent's boundary (e.g. "prod-eu").
+	// Required for discover jobs: the agent stamps every discovered
+	// secret with this name so the CP can tell the same secret_ref apart
+	// across clusters.
 	ClusterName string
 
-	// Transit-security knobs. Default posture: REQUIRE https://. The
-	// agent refuses to start on http:// unless InsecureTransport is
-	// explicitly true. Production deployments should never set
-	// InsecureTransport; it exists for `docker compose` dev only.
-	//
-	// CAFile + TLSServerName let operators pin the CP's CA / SNI when
-	// the CP serves TLS behind a private CA or a mismatching cert.
+	// Transit security. The agent refuses http:// unless
+	// InsecureTransport is set (docker compose dev only). CAFile and
+	// TLSServerName pin the CP's CA and SNI.
 	InsecureTransport bool
 	CAFile            string
 	TLSServerName     string
-
-	// Enroll-on-first-boot (agent-1). Enrollment runs ONLY when no stored
-	// credential exists (env vars or a populated IdentityFile) AND
-	// EnrollmentEnabled is true AND EnrollmentToken is non-empty. The
-	// returned agent_token is persisted to IdentityFile so a restart
-	// reuses it and never spends a second token.
-	EnrollmentEnabled bool
-	EnrollmentToken   string
-	AgentName         string
-	ProviderType      string
-	Region            string
 }
-
-// Env var names for credential material.
-const (
-	envAgentID         = "SB_AGENT_ID"
-	envAgentSecret     = "SB_AGENT_SECRET"
-	envEnrollmentToken = "SB_ENROLLMENT_TOKEN"
-)
 
 // retryBackoff is an exponential backoff between attempts, capped at max.
 type retryBackoff struct {
@@ -94,19 +82,58 @@ type retryBackoff struct {
 	max     time.Duration
 }
 
-// pubKeyRetry paces public-key registration retries at boot. A variable so
-// tests can shrink it.
-var pubKeyRetry = retryBackoff{initial: time.Second, max: time.Minute}
+// startupRetry paces the first heartbeat at boot. A variable so tests can
+// shrink it.
+var startupRetry = retryBackoff{initial: time.Second, max: time.Minute}
+
+// isFatal reports a CP answer that must stop the agent: the credential is
+// revoked (401) or the bound key is not ours (409 agent_key_mismatch).
+func isFatal(err error) bool {
+	return errors.Is(err, client.ErrUnauthorized) || errors.Is(err, client.ErrKeyMismatch)
+}
 
 func main() {
-	cfg := loadConfig()
-	logger := observability.NewLogger(os.Getenv("LOG_LEVEL"))
+	os.Exit(dispatch(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+}
+
+// dispatch picks the subcommand. No subcommand (or only flags) runs the
+// agent.
+func dispatch(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "enroll":
+			return cli.Enroll(context.Background(), args[1:], stdin, stdout, stderr)
+		case "rotate-key":
+			return cli.RotateKey(context.Background(), args[1:], stdin, stdout, stderr)
+		case "help":
+			_, _ = fmt.Fprint(stderr, cli.Usage)
+			return 0
+		}
+		if len(args[0]) > 0 && args[0][0] != '-' {
+			_, _ = fmt.Fprintf(stderr, "error: unknown command %q\n\n%s", args[0], cli.Usage)
+			return 2
+		}
+	}
+	return runAgent(args, stderr)
+}
+
+// runAgent is the agent runtime.
+func runAgent(args []string, stderr io.Writer) int {
+	cfg, err := loadConfig(args, stderr)
+	if err != nil {
+		if errors.Is(err, errHelp) {
+			return 0
+		}
+		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	logger := observability.NewLogger(stderr, os.Getenv("LOG_LEVEL"))
 	slog.SetDefault(logger)
 
 	logger.Info("starting secrets-bridge agent",
 		"version", buildVersion,
-		"cp_endpoint", redactEndpoint(cfg.CPEndpoint),
-		"identity_file", cfg.IdentityFile,
+		"cp_endpoint", transport.RedactEndpoint(cfg.CPEndpoint),
+		"credentials_dir", cfg.CredentialsDir,
 		"local_addr", cfg.LocalAddr,
 		"heartbeat_interval", cfg.HeartbeatInterval,
 		"claim_interval", cfg.ClaimInterval,
@@ -114,61 +141,45 @@ func main() {
 	)
 
 	// Transit-security gate: refuse plain http:// unless explicitly
-	// opted in. Fails fast so a misconfigured deployment never starts
-	// rather than silently leaking plaintext on the wire.
-	endpointURL, err := validateEndpoint(cfg.CPEndpoint, cfg.InsecureTransport)
+	// opted in.
+	endpointURL, err := transport.ValidateEndpoint(cfg.CPEndpoint, cfg.InsecureTransport)
 	if err != nil {
 		logger.Error("endpoint validation failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	if cfg.InsecureTransport {
-		logger.Warn("SB_INSECURE_TRANSPORT=true — plaintext over the wire; do NOT use in production",
-			"endpoint", redactEndpoint(endpointURL.String()))
+		logger.Warn("SB_INSECURE_TRANSPORT=true: plaintext over the wire; do NOT use in production",
+			"endpoint", transport.RedactEndpoint(endpointURL.String()))
 	}
+
+	// Credentials come only from the read-only directory. Fail closed.
+	id, kp, err := identity.Load(cfg.CredentialsDir)
+	if err != nil {
+		logger.Error("agent credentials not usable; refusing to start (create them with secrets-bridge-agent enroll and mount them read-only)",
+			"credentials_dir", cfg.CredentialsDir, "error", err)
+		return 1
+	}
+	logger.Info("credentials loaded",
+		"agent_id", id.AgentID,
+		"public_key_fingerprint", kp.Fingerprint)
+
+	hc, err := transport.NewHTTPClient(transport.Options{
+		CPEndpoint:        cfg.CPEndpoint,
+		InsecureTransport: cfg.InsecureTransport,
+		CAFile:            cfg.CAFile,
+		TLSServerName:     cfg.TLSServerName,
+	})
+	if err != nil {
+		logger.Error("transport setup failed", "error", err)
+		return 1
+	}
+	cpClient := client.New(cfg.CPEndpoint).WithHTTPClient(hc).WithKeyFingerprint(kp.Fingerprint)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Load (or generate) the X25519 keypair used for wire-envelope
-	// encryption with the CP (Piece 8b). Private key never leaves this
-	// process; the public key is registered after the credential is
-	// resolved so the CP can start sealing future responses.
-	kp, err := identity.LoadOrGenerateKeyPair(identity.EnvPrivateKey, identity.EnvPrivateKeyFile)
-	if err != nil {
-		logger.Error("keypair load failed", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("wire-envelope keypair ready",
-		"source", string(kp.Source),
-		"public_key_b64", base64.StdEncoding.EncodeToString(kp.Public))
-	if kp.Source == identity.KeyPairSourceEphemeral {
-		logger.Warn("wire-envelope keypair is EPHEMERAL — set SB_AGENT_PRIVATE_KEY[_FILE] for persistence; sealed wraps unconsumed at restart will be unrecoverable")
-	}
-
-	// Build the CP client BEFORE resolving the credential — enroll-on-
-	// first-boot needs it to call /agents/enroll.
-	transportClient, err := buildHTTPClient(cfg)
-	if err != nil {
-		logger.Error("transport setup failed", "error", err)
-		os.Exit(1)
-	}
-	httpClient := client.New(cfg.CPEndpoint).WithHTTPClient(transportClient)
-
-	// Resolve the agent credential: use a stored one (env vars or a
-	// populated identity file) if present; otherwise enroll-on-first-boot
-	// with the one-time token and persist the result. Fails closed when
-	// neither is available. The token + returned agent_token are never
-	// logged.
-	id, src, err := resolveIdentity(ctx, &cfg, httpClient, logger)
-	if err != nil {
-		logger.Error("agent credential not available", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("identity ready", "source", string(src), "agent_id", id.AgentID)
-
-	// Probes come up before registration so liveness passes while the
-	// agent waits for the CP; readiness stays false until run() has a
-	// registered key and starts claiming.
+	// Probes come up first so liveness passes while the agent waits for
+	// the CP; readiness stays false until the first heartbeat succeeds.
 	probes := local.NewProbes()
 	localServer := local.NewServer(cfg.LocalAddr, probes, logger)
 	go func() {
@@ -177,76 +188,99 @@ func main() {
 		}
 	}()
 
-	runErr := run(ctx, logger, cfg, httpClient, id, kp, executor.ResolverByType(ctx), probes)
+	runErr := run(ctx, logger, cfg, cpClient, id, kp, executor.ResolverByType(ctx), probes)
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
 	defer cancel()
 	_ = localServer.Shutdown(shutdownCtx)
-	if runErr != nil && ctx.Err() == nil {
-		logger.Error("agent stopped before it could claim jobs", "error", runErr)
-		cancel()
-		os.Exit(1)
+	if runErr != nil {
+		logger.Error(fatalMessage(runErr), "error", runErr)
+		return 1
 	}
 	logger.Info("shutdown complete")
+	return 0
 }
 
-// run takes over once the agent has a credential and a keypair.
+// fatalMessage explains a fatal stop to the operator.
+func fatalMessage(err error) string {
+	switch {
+	case errors.Is(err, client.ErrKeyMismatch):
+		return "agent_key_mismatch: the control plane has a different public key bound to this agent " +
+			"(the key was rotated, or this pod mounts the wrong Secret); update the Secret with the current bundle and restart"
+	case errors.Is(err, client.ErrUnauthorized):
+		return "the control plane rejected the agent credential (revoked or wrong agent_secret); enroll a new agent"
+	default:
+		return "agent stopped"
+	}
+}
+
+// run takes over once the agent has its credentials.
 //
-// AGT-02 (no unsealed fallback): it first blocks until the CP has accepted
-// the agent's public key, retrying with backoff. No heartbeat is sent and
-// no job is claimed before that. The executors are then always built with
-// the keypair, so values move sealed or not at all; there is no mode where
-// a failed registration leaves the agent running on plaintext over TLS.
-// The keypair source (env, file or ephemeral) no longer changes this.
-//
-// After registration it marks the agent ready and runs the heartbeat and
-// claim loops until ctx ends. It returns an error only when registration
-// could not complete (ctx ended, or the CP rejected the credential).
+// It first sends one heartbeat, retrying transient failures with backoff,
+// so a revoked credential or a mismatched key is reported before any job
+// is claimed. It then marks the agent ready and runs the heartbeat and
+// claim loops until ctx ends or the CP returns a fatal answer (401 or 409
+// agent_key_mismatch), which is returned. A clean shutdown returns nil.
 func run(ctx context.Context, logger *slog.Logger, cfg Config, c *client.Client, id identity.Identity, kp *identity.KeyPair, resolve executor.ProviderResolver, probes *local.Probes) error {
-	if err := registerPublicKey(ctx, logger, c, id, kp.Public, pubKeyRetry); err != nil {
+	report := &client.HeartbeatReport{Status: "active", AgentVersion: buildVersion, Capabilities: capabilities}
+	next, err := firstHeartbeat(ctx, logger, c, id, report, startupRetry)
+	if err != nil {
+		if ctx.Err() != nil && !isFatal(err) {
+			return nil
+		}
 		return err
 	}
-	logger.Info("public key registered with CP — sealed wire-envelope active")
+	logger.Info("control plane accepted the credential and key; sealed wire-envelope active")
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		fatalOnce sync.Once
+		fatalErr  error
+	)
+	fatal := func(err error) {
+		fatalOnce.Do(func() {
+			fatalErr = err
+			cancel()
+		})
+	}
 
 	exec := newRouter(cfg, c, id, kp, resolve)
 	probes.SetReady(true)
 
-	// Two loops share the same ctx so SIGTERM cancels both. WaitGroup
-	// blocks until both have drained.
+	interval := cfg.HeartbeatInterval
+	if next > 0 {
+		interval = next
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); heartbeatLoop(ctx, logger, cfg, c, id) }()
-	go func() { defer wg.Done(); claimLoop(ctx, logger, cfg, c, exec, id) }()
+	go func() { defer wg.Done(); heartbeatLoop(runCtx, logger, cfg, c, id, report, interval, fatal) }()
+	go func() { defer wg.Done(); claimLoop(runCtx, logger, cfg, c, exec, id, fatal) }()
 	wg.Wait()
 	probes.SetReady(false)
 	logger.Info("loops drained")
-	return nil
+	return fatalErr
 }
 
-// registerPublicKey PUTs the agent's X25519 public key until the CP
-// accepts it. Transient failures (network, 5xx, 404 from a CP that is
-// still rolling out) are retried with exponential backoff; a 401 means
-// the credential is revoked or wrong and is returned at once, as are
-// ctx cancellation and shutdown.
-func registerPublicKey(ctx context.Context, logger *slog.Logger, c *client.Client, id identity.Identity, pub []byte, b retryBackoff) error {
+// firstHeartbeat sends the boot heartbeat until the CP answers. A fatal
+// answer is returned at once; anything else is retried with backoff.
+func firstHeartbeat(ctx context.Context, logger *slog.Logger, c *client.Client, id identity.Identity, report *client.HeartbeatReport, b retryBackoff) (time.Duration, error) {
 	delay := b.initial
 	for attempt := 1; ; attempt++ {
-		callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := c.SetPublicKey(callCtx, id.AgentID, id.AgentSecret, pub, "x25519")
-		cancel()
+		next, err := beatOnce(ctx, logger, c, id, report)
 		if err == nil {
-			return nil
+			return next, nil
 		}
-		if errors.Is(err, client.ErrUnauthorized) {
-			return fmt.Errorf("public-key registration rejected: %w", err)
+		if isFatal(err) {
+			return 0, err
 		}
-		logger.Warn("public-key registration failed; no job will be claimed until it succeeds",
+		logger.Warn("first heartbeat failed; no job will be claimed until it succeeds",
 			"attempt", attempt, "retry_in", delay.String(), "error", err)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return fmt.Errorf("public-key registration did not complete: %w", ctx.Err())
+			return 0, fmt.Errorf("first heartbeat did not complete: %w", ctx.Err())
 		case <-timer.C:
 		}
 		delay = min(delay*2, b.max)
@@ -254,7 +288,7 @@ func registerPublicKey(ctx context.Context, logger *slog.Logger, c *client.Clien
 }
 
 // newRouter wires the per-type executors. Every executor that moves a
-// value gets the registered keypair; job types not listed here fail as
+// value gets the wire key; job types not listed here fail as
 // unsupported (AGT-N-06).
 func newRouter(cfg Config, c *client.Client, id identity.Identity, kp *identity.KeyPair, resolve executor.ProviderResolver) executor.Router {
 	return executor.Router{
@@ -286,49 +320,11 @@ func newRouter(cfg Config, c *client.Client, id identity.Identity, kp *identity.
 	}
 }
 
-// redactEndpoint returns the CP endpoint for logging with userinfo, query
-// and fragment removed, so credentials embedded in SB_CP_ENDPOINT never
-// reach the logs (AGT-N-08).
-func redactEndpoint(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "<unparseable endpoint>"
-	}
-	u.User = nil
-	u.RawQuery = ""
-	u.ForceQuery = false
-	u.Fragment = ""
-	u.RawFragment = ""
-	return u.String()
-}
-
-// scrubEnrollmentToken drops the one-time enrollment token from cfg and
-// from the process environment once identity resolution is done, so
-// nothing later in the process (or a child it might start) can read it
-// (AGT-N-08). It can't clear /proc/<pid>/environ or a --enrollment-token
-// flag in argv; the token is single-use, which is the real protection.
-func scrubEnrollmentToken(cfg *Config) {
-	cfg.EnrollmentToken = ""
-	_ = os.Unsetenv(envEnrollmentToken)
-}
-
-// heartbeatLoop beats the CP at a SERVER-DRIVEN cadence: each heartbeat
-// carries a small runtime body and the CP replies with next_heartbeat_
-// seconds, which sets the next interval. When the CP omits it (or replies
-// 204), the loop falls back to the configured HeartbeatInterval. An
-// Unauthorized response is fatal — the identity was revoked or the
-// credential is wrong, so the loop stops rather than spin.
-func heartbeatLoop(ctx context.Context, logger *slog.Logger, cfg Config, c *client.Client, id identity.Identity) {
-	interval := cfg.HeartbeatInterval
-	report := &client.HeartbeatReport{Status: "active", AgentVersion: buildVersion}
-
-	// First beat immediately so the CP sees us alive right after startup.
-	if next, err := beatOnce(ctx, logger, c, id, report, cfg.HeartbeatInterval); errors.Is(err, client.ErrUnauthorized) {
-		return
-	} else if next > 0 {
-		interval = next
-	}
-
+// heartbeatLoop beats the CP at a server-driven cadence: the CP's
+// next_heartbeat_seconds sets the next interval, and the configured
+// HeartbeatInterval is the fallback. A fatal answer (401 or 409
+// agent_key_mismatch) is handed to fatal, which stops the agent.
+func heartbeatLoop(ctx context.Context, logger *slog.Logger, cfg Config, c *client.Client, id identity.Identity, report *client.HeartbeatReport, interval time.Duration, fatal func(error)) {
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	for {
@@ -336,10 +332,12 @@ func heartbeatLoop(ctx context.Context, logger *slog.Logger, cfg Config, c *clie
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			next, err := beatOnce(ctx, logger, c, id, report, cfg.HeartbeatInterval)
-			if errors.Is(err, client.ErrUnauthorized) {
+			next, err := beatOnce(ctx, logger, c, id, report)
+			if isFatal(err) {
+				fatal(err)
 				return
 			}
+			interval = cfg.HeartbeatInterval
 			if next > 0 {
 				interval = next
 			}
@@ -349,14 +347,15 @@ func heartbeatLoop(ctx context.Context, logger *slog.Logger, cfg Config, c *clie
 }
 
 // beatOnce sends one heartbeat and returns the server-suggested next
-// interval (0 when absent → caller keeps its current interval). fallback is
-// used only for logging clarity; the caller owns the fallback interval.
-func beatOnce(ctx context.Context, logger *slog.Logger, c *client.Client, id identity.Identity, report *client.HeartbeatReport, fallback time.Duration) (time.Duration, error) {
+// interval (0 when absent).
+func beatOnce(ctx context.Context, logger *slog.Logger, c *client.Client, id identity.Identity, report *client.HeartbeatReport) (time.Duration, error) {
 	hbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	res, err := c.Heartbeat(hbCtx, id.AgentID, id.AgentSecret, report)
 	if err != nil {
-		logger.Warn("heartbeat failed", "error", err)
+		if !isFatal(err) && ctx.Err() == nil {
+			logger.Warn("heartbeat failed", "error", err)
+		}
 		return 0, err
 	}
 	var next time.Duration
@@ -374,98 +373,11 @@ func nextSeconds(res *client.HeartbeatResult) int {
 	return res.NextHeartbeatSeconds
 }
 
-// resolveIdentity returns the agent's credential. Precedence:
-//
-//  1. Stored credential — env vars (SB_AGENT_ID + SB_AGENT_SECRET) or a
-//     populated identity file. Covers the legacy static-secret path AND an
-//     enrolled agent that already persisted its credential (restart reuse).
-//  2. No stored credential + enrollment enabled + a token present → enroll
-//     once, persist the returned credential to the identity file, and seed
-//     the heartbeat/claim intervals from the response.
-//  3. Otherwise → fail closed with a safe error.
-//
-// The enrollment token and the returned agent_token are never logged,
-// printed, or wrapped into an error, and the token is scrubbed from cfg
-// and the process env before this returns.
-func resolveIdentity(ctx context.Context, cfg *Config, c *client.Client, logger *slog.Logger) (identity.Identity, identity.Source, error) {
-	// The token is needed at most once, below. Drop it on every exit path.
-	defer scrubEnrollmentToken(cfg)
-
-	id, src, err := identity.LoadStored(envAgentID, envAgentSecret, cfg.IdentityFile)
-	switch {
-	case err == nil:
-		return id, src, nil
-	case !errors.Is(err, identity.ErrNotConfigured):
-		// Partial env config or a corrupt file — a real misconfiguration.
-		return identity.Identity{}, "", err
-	}
-
-	// No stored credential — the enroll-on-first-boot path.
-	if !cfg.EnrollmentEnabled || cfg.EnrollmentToken == "" {
-		return identity.Identity{}, "", errors.New(
-			"agent credential not configured: set SB_AGENT_ID+SB_AGENT_SECRET, mount a " +
-				"populated identity file, or provide SB_ENROLLMENT_TOKEN with SB_ENROLLMENT_ENABLED=true")
-	}
-
-	name := cfg.AgentName
-	if name == "" {
-		if hn, herr := os.Hostname(); herr == nil {
-			name = hn
-		}
-	}
-	logger.Info("no stored credential — enrolling with CP",
-		"agent_name", name, "provider_type", cfg.ProviderType, "cluster_name", cfg.ClusterName)
-
-	res, err := c.Enroll(ctx, client.EnrollRequest{
-		EnrollmentToken: cfg.EnrollmentToken,
-		AgentName:       name,
-		ProviderType:    cfg.ProviderType,
-		ClusterName:     cfg.ClusterName,
-		AgentVersion:    buildVersion,
-		Region:          cfg.Region,
-	})
-	if err != nil {
-		// err carries only a safe reason code — never the token.
-		return identity.Identity{}, "", fmt.Errorf("enrollment failed: %w", err)
-	}
-
-	newID := identity.Identity{AgentID: res.AgentID, AgentSecret: res.AgentToken}
-	if err := identity.Save(cfg.IdentityFile, newID); err != nil {
-		// The token is now consumed but we couldn't persist the result —
-		// surface loudly so the operator fixes the writable path or issues
-		// a fresh token instead of CrashLooping on a spent token.
-		return identity.Identity{}, "", fmt.Errorf(
-			"enrolled but FAILED to persist credential to %q (token is now consumed; "+
-				"use a writable, restart-persistent identity path or issue a fresh token): %w",
-			cfg.IdentityFile, err)
-	}
-	logger.Info("enrolled and persisted credential",
-		"agent_id", res.AgentID,
-		"provider_connection_id", res.ProviderConnectionID,
-		"identity_file", cfg.IdentityFile)
-
-	applyEnrollIntervals(cfg, res)
-	return newID, identity.SourceEnrolled, nil
-}
-
-// applyEnrollIntervals seeds the heartbeat/claim cadence from the enrollment
-// response, but only for a knob the operator did NOT explicitly set via env
-// var (an explicit setting always wins). Heartbeat cadence is further
-// refined per-beat by next_heartbeat_seconds; claim cadence is fixed.
-func applyEnrollIntervals(cfg *Config, res *client.EnrollResult) {
-	if _, set := os.LookupEnv("SB_HEARTBEAT_INTERVAL"); !set && res.HeartbeatIntervalSeconds > 0 {
-		cfg.HeartbeatInterval = time.Duration(res.HeartbeatIntervalSeconds) * time.Second
-	}
-	if _, set := os.LookupEnv("SB_CLAIM_INTERVAL"); !set && res.JobPollIntervalSeconds > 0 {
-		cfg.ClaimInterval = time.Duration(res.JobPollIntervalSeconds) * time.Second
-	}
-}
-
 // claimLoop polls the CP for runnable jobs and dispatches each to a
 // worker pool. Concurrency is bounded by ClaimConcurrency — a
 // semaphore prevents the agent from claiming faster than it can
 // execute.
-func claimLoop(ctx context.Context, logger *slog.Logger, cfg Config, c *client.Client, exec executor.Executor, id identity.Identity) {
+func claimLoop(ctx context.Context, logger *slog.Logger, cfg Config, c *client.Client, exec executor.Executor, id identity.Identity, fatal func(error)) {
 	t := time.NewTicker(cfg.ClaimInterval)
 	defer t.Stop()
 
@@ -484,22 +396,26 @@ func claimLoop(ctx context.Context, logger *slog.Logger, cfg Config, c *client.C
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			claimOne(ctx, logger, c, exec, id, sem, &inflight)
+			if err := claimOne(ctx, logger, c, exec, id, sem, &inflight); isFatal(err) {
+				fatal(err)
+				return
+			}
 		}
 	}
 }
 
 // claimOne attempts a single claim. On success it dispatches the job
 // to a goroutine that executes and reports completion. Slot acquisition
-// is non-blocking — if the pool is full we skip this tick.
-func claimOne(ctx context.Context, logger *slog.Logger, c *client.Client, exec executor.Executor, id identity.Identity, sem chan struct{}, inflight *sync.WaitGroup) {
+// is non-blocking: if the pool is full we skip this tick. It returns the
+// claim error so the loop can stop on a fatal one.
+func claimOne(ctx context.Context, logger *slog.Logger, c *client.Client, exec executor.Executor, id identity.Identity, sem chan struct{}, inflight *sync.WaitGroup) error {
 	// Don't even bother claiming if there's no room to execute. Better
 	// to let another agent claim than to hold a claim that we won't
 	// process until later.
 	select {
 	case sem <- struct{}{}:
 	default:
-		return
+		return nil
 	}
 
 	claimCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -511,15 +427,12 @@ func claimOne(ctx context.Context, logger *slog.Logger, c *client.Client, exec e
 		case errors.Is(err, client.ErrNoJobs):
 			// Normal — queue empty. Debug level so we don't spam logs.
 			logger.Debug("no jobs in queue")
-		case errors.Is(err, client.ErrUnauthorized):
-			// Fatal — identity is gone. The loop's outer select will
-			// observe the context (canceled by signal) — but the
-			// agent process won't exit just on this. Log loudly.
-			logger.Error("claim rejected — identity revoked?", "error", err)
+		case isFatal(err):
+			// The caller stops the agent.
 		default:
 			logger.Warn("claim failed", "error", err)
 		}
-		return
+		return err
 	}
 
 	inflight.Add(1)
@@ -536,6 +449,7 @@ func claimOne(ctx context.Context, logger *slog.Logger, c *client.Client, exec e
 		}()
 		processJob(ctx, logger, c, exec, id, job)
 	}()
+	return nil
 }
 
 // processJob runs the executor and reports the outcome. Honors both the

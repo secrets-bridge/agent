@@ -1,18 +1,29 @@
 package main
 
 import (
+	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/secrets-bridge/agent/internal/cli"
+	"github.com/secrets-bridge/agent/internal/identity"
 )
 
-// loadConfig reads the agent's configuration from env vars and CLI flags.
-func loadConfig() Config {
+// errHelp is returned by loadConfig after printing -h output.
+var errHelp = errors.New("help requested")
+
+// loadConfig reads the runtime configuration from env vars and flags.
+// Credentials are not configuration: they come only from the files in
+// CredentialsDir.
+func loadConfig(args []string, stderr io.Writer) (Config, error) {
 	cfg := Config{
 		CPEndpoint:        envOr("SB_CP_ENDPOINT", ""),
-		IdentityFile:      envOr("SB_IDENTITY_FILE", "/etc/secrets-bridge/identity.json"),
+		CredentialsDir:    envOr("SB_AGENT_CREDENTIALS_DIR", identity.DefaultCredentialsDir),
 		LocalAddr:         envOr("SB_LOCAL_ADDR", "127.0.0.1:8090"),
 		HeartbeatInterval: envDuration("SB_HEARTBEAT_INTERVAL", 30*time.Second),
 		ClaimInterval:     envDuration("SB_CLAIM_INTERVAL", 5*time.Second),
@@ -22,58 +33,49 @@ func loadConfig() Config {
 		InsecureTransport: envBool("SB_INSECURE_TRANSPORT", false),
 		CAFile:            envOr("SB_CP_CA_FILE", ""),
 		TLSServerName:     envOr("SB_CP_TLS_SERVER_NAME", ""),
-
-		// Enroll-on-first-boot (agent-1). When no stored credential exists
-		// AND enrollment is enabled with a token, the agent exchanges the
-		// one-time token for a persistent credential and writes it to
-		// IdentityFile. Providing SB_AGENT_ID+SB_AGENT_SECRET or a
-		// populated identity file takes precedence and skips enrollment.
-		EnrollmentEnabled: envBool("SB_ENROLLMENT_ENABLED", true),
-		EnrollmentToken:   envOr("SB_ENROLLMENT_TOKEN", ""),
-		AgentName:         envOr("SB_AGENT_NAME", ""),
-		ProviderType:      envOr("SB_PROVIDER_TYPE", "aws-sm"),
-		Region:            envOr("SB_REGION", ""),
 	}
 
-	flag.StringVar(&cfg.CPEndpoint, "cp-endpoint", cfg.CPEndpoint,
+	fs := flag.NewFlagSet("secrets-bridge-agent", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		_, _ = fmt.Fprint(stderr, cli.Usage+"\nAgent runtime flags:\n")
+		fs.PrintDefaults()
+	}
+	fs.StringVar(&cfg.CPEndpoint, "cp-endpoint", cfg.CPEndpoint,
 		"Control Plane API base URL (also SB_CP_ENDPOINT)")
-	flag.StringVar(&cfg.IdentityFile, "identity-file", cfg.IdentityFile,
-		"JSON identity file {agent_id, agent_secret} (also SB_IDENTITY_FILE). "+
-			"Ignored when SB_AGENT_ID + SB_AGENT_SECRET env vars are set.")
-	flag.StringVar(&cfg.LocalAddr, "local-addr", cfg.LocalAddr,
+	fs.StringVar(&cfg.CredentialsDir, "credentials-dir", cfg.CredentialsDir,
+		"read-only directory with agent_id, agent_secret and private_key (also SB_AGENT_CREDENTIALS_DIR)")
+	fs.StringVar(&cfg.LocalAddr, "local-addr", cfg.LocalAddr,
 		"address for /healthz /readyz /metrics; loopback by default (also SB_LOCAL_ADDR)")
-	flag.DurationVar(&cfg.HeartbeatInterval, "heartbeat-interval", cfg.HeartbeatInterval,
-		"time between heartbeats (also SB_HEARTBEAT_INTERVAL)")
-	flag.DurationVar(&cfg.ClaimInterval, "claim-interval", cfg.ClaimInterval,
+	fs.DurationVar(&cfg.HeartbeatInterval, "heartbeat-interval", cfg.HeartbeatInterval,
+		"fallback time between heartbeats when the CP suggests none (also SB_HEARTBEAT_INTERVAL)")
+	fs.DurationVar(&cfg.ClaimInterval, "claim-interval", cfg.ClaimInterval,
 		"time between job claim polls (also SB_CLAIM_INTERVAL)")
-	flag.IntVar(&cfg.ClaimConcurrency, "claim-concurrency", cfg.ClaimConcurrency,
+	fs.IntVar(&cfg.ClaimConcurrency, "claim-concurrency", cfg.ClaimConcurrency,
 		"max in-flight jobs (also SB_CLAIM_CONCURRENCY)")
-	flag.DurationVar(&cfg.ShutdownGrace, "shutdown-grace", cfg.ShutdownGrace,
+	fs.DurationVar(&cfg.ShutdownGrace, "shutdown-grace", cfg.ShutdownGrace,
 		"graceful-shutdown deadline (also SB_SHUTDOWN_GRACE)")
-	flag.StringVar(&cfg.ClusterName, "cluster-name", cfg.ClusterName,
+	fs.StringVar(&cfg.ClusterName, "cluster-name", cfg.ClusterName,
 		"cluster identity stamped on discovered secrets (also SB_CLUSTER_NAME)")
-	flag.BoolVar(&cfg.InsecureTransport, "insecure-transport", cfg.InsecureTransport,
+	fs.BoolVar(&cfg.InsecureTransport, "insecure-transport", cfg.InsecureTransport,
 		"allow plain http:// to the CP (DEV ONLY; also SB_INSECURE_TRANSPORT)")
-	flag.StringVar(&cfg.CAFile, "cp-ca-file", cfg.CAFile,
+	fs.StringVar(&cfg.CAFile, "cp-ca-file", cfg.CAFile,
 		"path to a CA bundle to trust for the CP cert (also SB_CP_CA_FILE)")
-	flag.StringVar(&cfg.TLSServerName, "cp-tls-server-name", cfg.TLSServerName,
+	fs.StringVar(&cfg.TLSServerName, "cp-tls-server-name", cfg.TLSServerName,
 		"override TLS SNI / cert verification hostname (also SB_CP_TLS_SERVER_NAME)")
-	flag.BoolVar(&cfg.EnrollmentEnabled, "enrollment-enabled", cfg.EnrollmentEnabled,
-		"allow enroll-on-first-boot when no stored credential exists (also SB_ENROLLMENT_ENABLED)")
-	flag.StringVar(&cfg.EnrollmentToken, "enrollment-token", cfg.EnrollmentToken,
-		"one-time enrollment token; used only on first boot (also SB_ENROLLMENT_TOKEN). REDACTED from logs")
-	flag.StringVar(&cfg.AgentName, "agent-name", cfg.AgentName,
-		"agent name reported at enrollment; defaults to hostname (also SB_AGENT_NAME)")
-	flag.StringVar(&cfg.ProviderType, "provider-type", cfg.ProviderType,
-		"provider type reported at enrollment, e.g. aws-sm/vault (also SB_PROVIDER_TYPE)")
-	flag.StringVar(&cfg.Region, "region", cfg.Region,
-		"region reported at enrollment (also SB_REGION)")
-	flag.Parse()
-
-	if cfg.CPEndpoint == "" {
-		panic("agent: SB_CP_ENDPOINT (or --cp-endpoint) is required")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return Config{}, errHelp
+		}
+		return Config{}, err
 	}
-	return cfg
+	if fs.NArg() != 0 {
+		return Config{}, errors.New("unexpected positional argument (not echoed)")
+	}
+	if cfg.CPEndpoint == "" {
+		return Config{}, errors.New("SB_CP_ENDPOINT (or --cp-endpoint) is required")
+	}
+	return cfg, nil
 }
 
 func envBool(key string, fallback bool) bool {
