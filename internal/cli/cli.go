@@ -45,7 +45,7 @@ var timeout = 90 * time.Second
 // maxTokenSize caps a token read from a file or stdin.
 const maxTokenSize = 4 << 10
 
-const defaultSecretName = "secrets-bridge-agent"
+const defaultSecretName = "secrets-bridge-agent-identity"
 
 // common holds the flags both subcommands share.
 type common struct {

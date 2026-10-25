@@ -358,7 +358,7 @@ func TestEnroll_StdinTokenStdoutFormats(t *testing.T) {
 					b[k] = v
 				}
 			case "k8s-secret":
-				for _, want := range []string{"apiVersion: v1\n", "kind: Secret\n", "  name: secrets-bridge-agent\n", "  namespace: secrets-bridge\n", "type: Opaque\n", "stringData:\n", "never commit"} {
+				for _, want := range []string{"apiVersion: v1\n", "kind: Secret\n", "  name: secrets-bridge-agent-identity\n", "  namespace: secrets-bridge\n", "type: Opaque\n", "stringData:\n", "never commit"} {
 					if !strings.Contains(r.stdout, want) {
 						t.Fatalf("manifest lacks %q:\n%s", want, r.stdout)
 					}

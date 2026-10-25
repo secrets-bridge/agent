@@ -69,7 +69,7 @@ secrets-bridge-agent enroll ... --output - | vault kv put secret/agents/payments
 
 # Kubernetes Secret, straight from an env file on stdin
 secrets-bridge-agent enroll ... --format env --output - \
-  | kubectl -n secrets-bridge create secret generic secrets-bridge-agent --from-env-file=/dev/stdin
+  | kubectl -n secrets-bridge create secret generic secrets-bridge-agent-identity --from-env-file=/dev/stdin
 
 # Kubernetes Secret manifest (apply it, never commit it)
 secrets-bridge-agent enroll ... --format k8s-secret --namespace secrets-bridge --output - | kubectl apply -f -
@@ -85,7 +85,7 @@ docker run -i --rm ghcr.io/secrets-bridge/agent:dev enroll --cp-endpoint https:/
   --token-file - --name payments-uat --provider-type aws-sm --output - < token.txt
 ```
 
-The bundle has four fields: `agent_id`, `agent_secret`, `private_key` (base64) and `public_key_fingerprint`. Formats are `json` (default), `env` and `k8s-secret`. The CLI prints only the agent_id and the fingerprint to stderr. If the output file already exists, or the path is a symlink, the CLI stops before it calls the control plane, so the token is not spent.
+The Kubernetes Secret is named `secrets-bridge-agent-identity` by default (`--secret-name` changes it for `--format k8s-secret`), the name the chart's `identity.existingSecret` and the UI use. The bundle has four fields: `agent_id`, `agent_secret`, `private_key` (base64) and `public_key_fingerprint`. Formats are `json` (default), `env` and `k8s-secret`. The CLI prints only the agent_id and the fingerprint to stderr. If the output file already exists, or the path is a symlink, the CLI stops before it calls the control plane, so the token is not spent.
 
 ### Rotate the wire key
 
@@ -133,13 +133,13 @@ There are no credential env vars. `SB_AGENT_ID`, `SB_AGENT_SECRET`, `SB_AGENT_PR
 
 ### Kubernetes
 
-The chart mounts one Secret with the keys `agent_id`, `agent_secret` and `private_key` (`identity.existingSecret`):
+The chart mounts one Secret, `secrets-bridge-agent-identity` by default, with the keys `agent_id`, `agent_secret` and `private_key` (`identity.existingSecret`):
 
 ```yaml
 volumes:
   - name: credentials
     secret:
-      secretName: secrets-bridge-agent
+      secretName: secrets-bridge-agent-identity
       defaultMode: 0400
 volumeMounts:
   - { name: credentials, mountPath: /etc/secrets-bridge/agent, readOnly: true }
