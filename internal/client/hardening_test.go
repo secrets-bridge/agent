@@ -67,15 +67,20 @@ func TestClient_DoesNotFollowRedirects(t *testing.T) {
 		"complete": func(c *client.Client) error {
 			return c.CompleteJob(context.Background(), "agent-a", "secret-a", "job-1", client.JobOutcome{Status: client.StatusSucceeded})
 		},
-		"public-key": func(c *client.Client) error {
-			return c.SetPublicKey(context.Background(), "agent-a", "secret-a", make([]byte, 32), "x25519")
+		"rotation-challenge": func(c *client.Client) error {
+			_, err := c.KeyRotationChallenge(context.Background(), "agent-a", "secret-a", client.Secret("fake-enroll-token"), make([]byte, 32))
+			return err
 		},
 		"dek": func(c *client.Client) error {
 			_, err := c.IssueDEK(context.Background(), "agent-a", "secret-a")
 			return err
 		},
+		"enroll-challenge": func(c *client.Client) error {
+			_, err := c.EnrollChallenge(context.Background(), client.Secret("fake-enroll-token"), make([]byte, 32))
+			return err
+		},
 		"enroll": func(c *client.Client) error {
-			_, err := c.Enroll(context.Background(), client.EnrollRequest{EnrollmentToken: "fake-enroll-token", AgentName: "a"})
+			_, err := c.Enroll(context.Background(), client.EnrollRequest{EnrollmentToken: client.Secret("fake-enroll-token"), Name: "a"})
 			return err
 		},
 	}
@@ -159,12 +164,12 @@ func TestPostSecretsBulk_OversizedResponseRejected(t *testing.T) {
 }
 
 func TestEnroll_OversizedResponseRejected(t *testing.T) {
-	huge := `{"agent_id":"a","agent_token":"t","provider_connection_id":"` + strings.Repeat("p", 1<<20) + `"}`
+	huge := `{"agent_id":"a","agent_secret":"t","public_key_fingerprint":"` + strings.Repeat("p", 1<<20) + `"}`
 	c, _ := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(huge))
 	})
-	if _, err := c.Enroll(t.Context(), client.EnrollRequest{EnrollmentToken: "fake-enroll-token"}); !errors.Is(err, client.ErrResponseTooLarge) {
+	if _, err := c.Enroll(t.Context(), client.EnrollRequest{EnrollmentToken: client.Secret("fake-enroll-token")}); !errors.Is(err, client.ErrResponseTooLarge) {
 		t.Fatalf("got %v want a size-limit error", err)
 	}
 }

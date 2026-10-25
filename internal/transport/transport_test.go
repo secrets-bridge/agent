@@ -1,4 +1,4 @@
-package main
+package transport
 
 import (
 	"crypto/ecdsa"
@@ -29,7 +29,7 @@ func TestValidateEndpoint(t *testing.T) {
 		wantHint string
 	}{
 		{"https accepted", "https://cp.example.com", false, false, ""},
-		{"http refused by default", "http://cp.example.com", false, true, "refuse to start"},
+		{"http refused by default", "http://cp.example.com", false, true, "plain http://, refusing"},
 		{"http allowed with override", "http://cp.example.com", true, false, ""},
 		{"empty refused", "", false, true, "is required"},
 		{"weird scheme refused", "ftp://cp", false, true, "must be https://"},
@@ -38,7 +38,7 @@ func TestValidateEndpoint(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			u, err := validateEndpoint(tc.endpoint, tc.insecure)
+			u, err := ValidateEndpoint(tc.endpoint, tc.insecure)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("got %v want error", u)
@@ -59,7 +59,7 @@ func TestValidateEndpoint(t *testing.T) {
 }
 
 func TestBuildTLSConfig_NoCAFile_UsesSystemRoots(t *testing.T) {
-	cfg := Config{}
+	cfg := Options{}
 	tlsCfg, err := buildTLSConfig(cfg)
 	if err != nil {
 		t.Fatalf("buildTLSConfig: %v", err)
@@ -80,7 +80,7 @@ func TestBuildTLSConfig_CustomCA_LoadsPool(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	cfg := Config{CAFile: caPath}
+	cfg := Options{CAFile: caPath}
 	tlsCfg, err := buildTLSConfig(cfg)
 	if err != nil {
 		t.Fatalf("buildTLSConfig: %v", err)
@@ -98,7 +98,7 @@ func TestBuildTLSConfig_CustomCA_LoadsPool(t *testing.T) {
 }
 
 func TestBuildTLSConfig_CAFileMissing_Errors(t *testing.T) {
-	cfg := Config{CAFile: "/nonexistent/ca.pem"}
+	cfg := Options{CAFile: "/nonexistent/ca.pem"}
 	_, err := buildTLSConfig(cfg)
 	if err == nil {
 		t.Fatal("expected error for missing CA file")
@@ -109,7 +109,7 @@ func TestBuildTLSConfig_CAFileGarbage_Errors(t *testing.T) {
 	dir := t.TempDir()
 	caPath := filepath.Join(dir, "garbage")
 	_ = os.WriteFile(caPath, []byte("definitely not a PEM"), 0o600)
-	cfg := Config{CAFile: caPath}
+	cfg := Options{CAFile: caPath}
 	_, err := buildTLSConfig(cfg)
 	if err == nil {
 		t.Fatal("expected error for non-PEM file")
@@ -120,7 +120,7 @@ func TestBuildTLSConfig_CAFileGarbage_Errors(t *testing.T) {
 }
 
 func TestBuildTLSConfig_ServerNameOverride(t *testing.T) {
-	cfg := Config{TLSServerName: "alt.example.com"}
+	cfg := Options{TLSServerName: "alt.example.com"}
 	tlsCfg, _ := buildTLSConfig(cfg)
 	if tlsCfg.ServerName != "alt.example.com" {
 		t.Fatalf("ServerName = %q", tlsCfg.ServerName)
@@ -142,16 +142,16 @@ func TestBuildHTTPClient_HitsTLSServerWithPinnedCA(t *testing.T) {
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
 	_ = os.WriteFile(caPath, pemBytes, 0o600)
 
-	cfg := Config{
+	cfg := Options{
 		CPEndpoint: srv.URL,
 		CAFile:     caPath,
 		// httptest's cert is for "example.com" — we need to override
 		// SNI / verification host.
 		TLSServerName: "example.com",
 	}
-	hc, err := buildHTTPClient(cfg)
+	hc, err := NewHTTPClient(cfg)
 	if err != nil {
-		t.Fatalf("buildHTTPClient: %v", err)
+		t.Fatalf("NewHTTPClient: %v", err)
 	}
 	resp, err := hc.Get(srv.URL)
 	if err != nil {
@@ -175,14 +175,14 @@ func TestBuildHTTPClient_WrongCA_FailsHandshake(t *testing.T) {
 	caPath := filepath.Join(dir, "ca.pem")
 	_ = os.WriteFile(caPath, otherPEM, 0o600)
 
-	cfg := Config{
+	cfg := Options{
 		CPEndpoint:    srv.URL,
 		CAFile:        caPath,
 		TLSServerName: "example.com",
 	}
-	hc, err := buildHTTPClient(cfg)
+	hc, err := NewHTTPClient(cfg)
 	if err != nil {
-		t.Fatalf("buildHTTPClient: %v", err)
+		t.Fatalf("NewHTTPClient: %v", err)
 	}
 	if _, err := hc.Get(srv.URL); err == nil {
 		t.Fatal("expected TLS handshake failure against wrong CA")
@@ -202,15 +202,15 @@ func generateSelfSignedPEM(t *testing.T, cn string) ([]byte, []byte) {
 		t.Fatalf("generate key: %v", err)
 	}
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: cn},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-		DNSNames:     []string{cn},
-		IsCA:         true,
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:              []string{cn},
+		IsCA:                  true,
 		BasicConstraintsValid: true,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)

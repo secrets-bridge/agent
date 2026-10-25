@@ -13,7 +13,7 @@ import (
 // anything answering in its place, can't make the agent buffer an
 // unbounded body.
 const (
-	// maxSmallResponse covers heartbeat, enroll, DEK, public-key and
+	// maxSmallResponse covers heartbeat, enroll, rotation, DEK and
 	// post-wrap acknowledgements: a handful of short fields.
 	maxSmallResponse int64 = 64 << 10
 	// maxJobResponse covers a claimed job: ids, target config, key names

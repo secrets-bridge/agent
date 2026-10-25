@@ -1,4 +1,8 @@
-package main
+// Package transport builds the HTTPS client the agent runtime and the
+// enroll and rotate-key subcommands use to reach the control plane: https
+// only unless explicitly opted out for dev, TLS 1.2 minimum, an optional
+// pinned CA and SNI override, and no redirects.
+package transport
 
 import (
 	"crypto/tls"
@@ -12,7 +16,15 @@ import (
 	"time"
 )
 
-// validateEndpoint enforces the transit-security posture:
+// Options are the transport settings shared by the runtime and the CLI.
+type Options struct {
+	CPEndpoint        string
+	InsecureTransport bool
+	CAFile            string
+	TLSServerName     string
+}
+
+// ValidateEndpoint enforces the transit-security posture:
 //
 //   - Default: SB_CP_ENDPOINT must use https://. Anything else is a
 //     hard error at startup so a misconfigured deployment fails to
@@ -21,9 +33,9 @@ import (
 //     The caller is expected to log a loud warning when this is set.
 //
 // Returns the parsed URL on success.
-func validateEndpoint(endpoint string, insecure bool) (*url.URL, error) {
+func ValidateEndpoint(endpoint string, insecure bool) (*url.URL, error) {
 	if endpoint == "" {
-		return nil, errors.New("SB_CP_ENDPOINT is required")
+		return nil, errors.New("the control plane endpoint (SB_CP_ENDPOINT or --cp-endpoint) is required")
 	}
 	u, err := url.Parse(endpoint)
 	if err != nil {
@@ -34,7 +46,7 @@ func validateEndpoint(endpoint string, insecure bool) (*url.URL, error) {
 		if errors.As(err, &uerr) {
 			err = uerr.Err
 		}
-		return nil, fmt.Errorf("SB_CP_ENDPOINT is not a valid URL: %w", err)
+		return nil, fmt.Errorf("the control plane endpoint is not a valid URL: %w", err)
 	}
 	scheme := strings.ToLower(u.Scheme)
 	switch scheme {
@@ -43,22 +55,22 @@ func validateEndpoint(endpoint string, insecure bool) (*url.URL, error) {
 	case "http":
 		if !insecure {
 			return nil, errors.New(
-				"SB_CP_ENDPOINT uses plain http:// — refuse to start; " +
-					"use https:// in production, or set SB_INSECURE_TRANSPORT=true for dev only")
+				"the control plane endpoint uses plain http://, refusing; " +
+					"use https://, or set SB_INSECURE_TRANSPORT=true (--insecure-transport) for dev only")
 		}
 		return u, nil
 	default:
-		return nil, fmt.Errorf("SB_CP_ENDPOINT scheme %q must be https:// (or http:// with SB_INSECURE_TRANSPORT=true)", u.Scheme)
+		return nil, fmt.Errorf("the control plane endpoint scheme %q must be https:// (or http:// with --insecure-transport)", u.Scheme)
 	}
 }
 
-// buildHTTPClient constructs the HTTP client the agent uses for all
+// NewHTTPClient constructs the HTTP client the agent uses for all
 // CP traffic. When the endpoint is https:// the client gets a TLS
 // config built from system roots + any operator-supplied CA file +
 // optional SNI override. For http:// (dev mode) we still build the
 // same client, just without TLS — the transport is plain. The client
 // never follows redirects.
-func buildHTTPClient(cfg Config) (*http.Client, error) {
+func NewHTTPClient(cfg Options) (*http.Client, error) {
 	tlsCfg, err := buildTLSConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -97,7 +109,7 @@ func refuseRedirect(*http.Request, []*http.Request) error {
 //     System roots are intentionally NOT mixed in to keep the trust
 //     boundary tight.
 //   - TLSServerName is set → overrides SNI / cert-name verification.
-func buildTLSConfig(cfg Config) (*tls.Config, error) {
+func buildTLSConfig(cfg Options) (*tls.Config, error) {
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 	}
@@ -116,4 +128,20 @@ func buildTLSConfig(cfg Config) (*tls.Config, error) {
 		tlsCfg.RootCAs = pool
 	}
 	return tlsCfg, nil
+}
+
+// RedactEndpoint returns the CP endpoint for logging with userinfo, query
+// and fragment removed, so credentials embedded in the endpoint never
+// reach the logs (AGT-N-08).
+func RedactEndpoint(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable endpoint>"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.String()
 }

@@ -2,14 +2,15 @@
 package observability
 
 import (
+	"io"
 	"log/slog"
-	"os"
 	"strings"
 )
 
-// NewLogger returns a JSON structured logger.
-func NewLogger(levelStr string) *slog.Logger {
-	h := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(levelStr)})
+// NewLogger returns a JSON structured logger writing to w (stderr in the
+// binary).
+func NewLogger(w io.Writer, levelStr string) *slog.Logger {
+	h := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: parseLevel(levelStr)})
 	return slog.New(h).With("service", "secrets-bridge-agent")
 }
 

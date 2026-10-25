@@ -7,6 +7,8 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"hash"
 	"io"
 	"strings"
@@ -65,11 +67,11 @@ func sealForTest(t *testing.T, plaintext, recipientPub []byte) *sealing.Envelope
 
 func recipient(t *testing.T) (pub, priv []byte) {
 	t.Helper()
-	pub, priv, err := sealing.GenerateKeypair()
+	k, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("GenerateKeypair: %v", err)
+		t.Fatalf("GenerateKey: %v", err)
 	}
-	return pub, priv
+	return k.PublicKey().Bytes(), k.Bytes()
 }
 
 func TestOpen_RoundTrip(t *testing.T) {
@@ -176,7 +178,7 @@ func TestEncryptForCP_RoundTripAndKeyLength(t *testing.T) {
 	}
 }
 
-func TestGenerateKeypair_PublicMatchesPrivate(t *testing.T) {
+func TestPublicFromPrivate_MatchesGeneratedKey(t *testing.T) {
 	pub, priv := recipient(t)
 	if len(pub) != 32 || len(priv) != 32 {
 		t.Fatalf("key lengths pub=%d priv=%d", len(pub), len(priv))
@@ -200,4 +202,44 @@ func TestZero(t *testing.T) {
 		t.Fatal("Zero left bytes behind")
 	}
 	sealing.Zero(nil)
+}
+
+func TestFingerprint_Format(t *testing.T) {
+	pub := bytes.Repeat([]byte{0x11}, 32)
+	sum := sha256.Sum256(pub)
+	want := "sha256:" + strings.ToLower(hex.EncodeToString(sum[:]))
+	if got := sealing.Fingerprint(pub); got != want {
+		t.Fatalf("Fingerprint = %q want %q", got, want)
+	}
+}
+
+func TestValidatePublicKey(t *testing.T) {
+	pub, _ := recipient(t)
+	if err := sealing.ValidatePublicKey(pub); err != nil {
+		t.Fatalf("valid key refused: %v", err)
+	}
+	mustHex := func(s string) []byte {
+		b, err := hex.DecodeString(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	bad := map[string][]byte{
+		"short": make([]byte, 31),
+		"long":  make([]byte, 33),
+		"zero":  make([]byte, 32),
+		"one":   append([]byte{1}, make([]byte, 31)...),
+		// Order-8 points and non-canonical encodings of low-order points.
+		"order 8 a": mustHex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+		"order 8 b": mustHex("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+		"p - 1":     mustHex("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+		"p":         mustHex("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+		"p + 1":     mustHex("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+	}
+	for name, k := range bad {
+		if err := sealing.ValidatePublicKey(k); !errors.Is(err, sealing.ErrInvalidPublicKey) {
+			t.Errorf("%s: got %v want ErrInvalidPublicKey", name, err)
+		}
+	}
 }

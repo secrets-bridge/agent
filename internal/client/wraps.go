@@ -48,6 +48,10 @@ var ErrWrapGone = errors.New("client: wrap is gone (already consumed or expired)
 // 410 is terminal.
 var ErrRequestNotApproved = errors.New("client: wrap's owning request is not approved")
 
+// ErrWrongRecipientKey is returned when a wrap's recipient_key_fingerprint
+// is missing or is not this agent's key. The envelope is not opened.
+var ErrWrongRecipientKey = errors.New("client: wrap is sealed to a different public key; refusing to open it")
+
 // ErrContentHashMismatch is returned when the locally computed hash
 // of the decoded plaintext does not match the value the CP reported.
 // Means corruption in flight; never ship the value to a provider.
@@ -58,14 +62,16 @@ var ErrContentHashMismatch = errors.New("client: content_hash mismatch — refus
 // Sealed (wire-envelope, Piece 8b) shape; Value (legacy plaintext over
 // TLS) is decoded only so a response carrying it can be refused.
 type wrapResponse struct {
-	WrapID      string                `json:"wrap_id"`
-	RequestID   string                `json:"request_id,omitempty"`
-	KeyName     string                `json:"key_name,omitempty"`
-	Value       string                `json:"value,omitempty"`
-	Sealed      *sealedEnvelopeOnWire `json:"sealed,omitempty"`
-	ByteLength  int                   `json:"byte_length"`
-	ContentHash string                `json:"content_hash"`
-	Algorithm   string                `json:"algorithm"`
+	WrapID    string                `json:"wrap_id"`
+	RequestID string                `json:"request_id,omitempty"`
+	KeyName   string                `json:"key_name,omitempty"`
+	Value     string                `json:"value,omitempty"`
+	Sealed    *sealedEnvelopeOnWire `json:"sealed,omitempty"`
+	// RecipientKeyFingerprint names the public key the CP sealed to.
+	RecipientKeyFingerprint string `json:"recipient_key_fingerprint"`
+	ByteLength              int    `json:"byte_length"`
+	ContentHash             string `json:"content_hash"`
+	Algorithm               string `json:"algorithm"`
 }
 
 // sealedEnvelopeOnWire is the JSON shape of the wire-envelope as it
@@ -80,12 +86,14 @@ type sealedEnvelopeOnWire struct {
 // GetWrap calls GET /api/v1/agents/:id/wraps/:wrap_id and returns the
 // opened plaintext + verified content_hash.
 //
-// Sealed only (AGT-02): agentPubKey + agentPrivKey (the agent's static
-// X25519 keypair, registered with the CP at boot) are required, and the
+// Sealed only (AGT-02): agentPubKey + agentPrivKey (the agent's X25519
+// key, bound to the agent on the CP at enrollment) are required, and the
 // call is refused before any request is sent when they are missing, so a
 // single-use wrap is never consumed by a caller that could only read it
 // unsealed. The CP response must carry a `sealed` envelope; a plaintext
 // `value` is refused as a downgrade whether or not it also carries a seal.
+// The response's recipient_key_fingerprint must equal the fingerprint of
+// agentPubKey, or the wrap is refused with ErrWrongRecipientKey.
 //
 // Caller MUST zero the returned Plaintext slice when done.
 func (c *Client) GetWrap(ctx context.Context, agentID, agentSecret, wrapID string, agentPubKey, agentPrivKey []byte) (*Wrap, error) {
@@ -97,10 +105,9 @@ func (c *Client) GetWrap(ctx context.Context, agentID, agentSecret, wrapID strin
 	if err != nil {
 		return nil, fmt.Errorf("client: build get-wrap request: %w", err)
 	}
-	req.Header.Set("X-Agent-Secret", agentSecret)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.hc.Do(req)
+	resp, err := c.doAgent(req, agentSecret)
 	if err != nil {
 		return nil, fmt.Errorf("client: get-wrap: %w", err)
 	}
@@ -126,6 +133,9 @@ func (c *Client) GetWrap(ctx context.Context, agentID, agentSecret, wrapID strin
 		return nil, fmt.Errorf("client: decode wrap: %w", err)
 	}
 
+	if body.RecipientKeyFingerprint != sealing.Fingerprint(agentPubKey) {
+		return nil, ErrWrongRecipientKey
+	}
 	pt, err := decodeWrapValue(&body, agentPubKey, agentPrivKey)
 	if err != nil {
 		return nil, err
@@ -195,51 +205,6 @@ func Zero(b []byte) {
 	}
 }
 
-// SetPublicKeyRequest is the body the agent PUTs to register its
-// X25519 public key. Idempotent on the CP side.
-type SetPublicKeyRequest struct {
-	PublicKey          string `json:"public_key"`           // base64
-	PublicKeyAlgorithm string `json:"public_key_algorithm"` // "x25519"
-}
-
-// SetPublicKey PUTs the agent's static X25519 public key to the CP so
-// future GetWrap responses come sealed. Idempotent — repeated calls
-// with the same key are no-ops. Returns nil on 204; ErrUnauthorized
-// on 401; ErrNotFound on 404; HTTPError otherwise.
-func (c *Client) SetPublicKey(ctx context.Context, agentID, agentSecret string, publicKey []byte, algorithm string) error {
-	body, err := json.Marshal(SetPublicKeyRequest{
-		PublicKey:          base64.StdEncoding.EncodeToString(publicKey),
-		PublicKeyAlgorithm: algorithm,
-	})
-	if err != nil {
-		return fmt.Errorf("client: marshal public-key body: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
-		c.base+"/api/v1/agents/"+agentID+"/public-key", bytesReader(body))
-	if err != nil {
-		return fmt.Errorf("client: build public-key request: %w", err)
-	}
-	req.Header.Set("X-Agent-Secret", agentSecret)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return fmt.Errorf("client: set public key: %w", err)
-	}
-	defer drainAndClose(resp.Body)
-
-	switch resp.StatusCode {
-	case http.StatusNoContent, http.StatusOK:
-		return nil
-	case http.StatusUnauthorized:
-		return ErrUnauthorized
-	case http.StatusNotFound:
-		return ErrNotFound
-	default:
-		return &HTTPError{Status: resp.StatusCode, Body: readSnippet(resp.Body)}
-	}
-}
-
 // PostWrapRequest is the JSON body of POST /api/v1/agents/:id/wraps.
 // Used by the agent's ReadExecutor: after GetValue returns the bundle,
 // the agent splits by key and POSTs one wrap per key here.
@@ -295,10 +260,9 @@ func (c *Client) IssueDEK(ctx context.Context, agentID, agentSecret string) (*DE
 	if err != nil {
 		return nil, fmt.Errorf("client: build dek request: %w", err)
 	}
-	req.Header.Set("X-Agent-Secret", agentSecret)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.hc.Do(req)
+	resp, err := c.doAgent(req, agentSecret)
 	if err != nil {
 		return nil, fmt.Errorf("client: dek: %w", err)
 	}
@@ -386,11 +350,10 @@ func (c *Client) PostWrap(ctx context.Context, agentID, agentSecret, requestID, 
 	if err != nil {
 		return nil, fmt.Errorf("client: build post-wrap request: %w", err)
 	}
-	req.Header.Set("X-Agent-Secret", agentSecret)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.hc.Do(req)
+	resp, err := c.doAgent(req, agentSecret)
 	if err != nil {
 		return nil, fmt.Errorf("client: post-wrap: %w", err)
 	}

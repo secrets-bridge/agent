@@ -55,10 +55,9 @@ func (c *Client) PostSecretsBulk(ctx context.Context, agentID, agentSecret strin
 	if err != nil {
 		return nil, fmt.Errorf("client: build secrets bulk request: %w", err)
 	}
-	req.Header.Set("X-Agent-Secret", agentSecret)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.hc.Do(req)
+	resp, err := c.doAgent(req, agentSecret)
 	if err != nil {
 		return nil, fmt.Errorf("client: secrets bulk: %w", err)
 	}

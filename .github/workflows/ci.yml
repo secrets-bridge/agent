@@ -74,6 +74,26 @@ jobs:
             exit 1
           fi
 
+  # skills#116: the runtime reads its credentials from a read-only
+  # directory and never writes a file or generates a key. These source
+  # guards parse every non-test file: only the CLI bundle output may open a
+  # file for writing, only the CLI key generator may call GenerateKey, and
+  # the removed self-enrollment surface stays removed. The behaviour tests
+  # in cmd/agent (restart writes nothing) run in the test job.
+  runtime-guards:
+    name: runtime-guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go test -count=1 -v ./internal/guard/
+      - run: go test -count=1 -run 'TestRuntime_|TestLoad_FileModes' ./cmd/agent/ ./internal/identity/
+
   # The agent MUST NOT carry a DB, Redis/KV, or ORM driver in its
   # dependency graph. Importing one would silently violate BRD §15 and
   # §24. This job greps go.sum for forbidden module paths and fails the

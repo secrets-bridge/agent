@@ -51,10 +51,9 @@ func (c *Client) ClaimJob(ctx context.Context, agentID, agentSecret string) (*Jo
 	if err != nil {
 		return nil, fmt.Errorf("client: build claim request: %w", err)
 	}
-	req.Header.Set("X-Agent-Secret", agentSecret)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.hc.Do(req)
+	resp, err := c.doAgent(req, agentSecret)
 	if err != nil {
 		return nil, fmt.Errorf("client: claim: %w", err)
 	}
@@ -93,10 +92,9 @@ func (c *Client) CompleteJob(ctx context.Context, agentID, agentSecret, jobID st
 	if err != nil {
 		return fmt.Errorf("client: build complete request: %w", err)
 	}
-	req.Header.Set("X-Agent-Secret", agentSecret)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.hc.Do(req)
+	resp, err := c.doAgent(req, agentSecret)
 	if err != nil {
 		return fmt.Errorf("client: complete: %w", err)
 	}

@@ -49,12 +49,13 @@ func sealedWrapBody(t *testing.T, plaintext, recipientPub []byte, contentHash st
 	t.Helper()
 	ct, nonce, ephPub := fakeSealForTest(t, plaintext, recipientPub)
 	return map[string]any{
-		"wrap_id":      "w",
-		"request_id":   "r",
-		"key_name":     "DB_PASSWORD",
-		"byte_length":  len(plaintext),
-		"content_hash": contentHash,
-		"algorithm":    "AES-256-GCM",
+		"wrap_id":                   "w",
+		"request_id":                "r",
+		"key_name":                  "DB_PASSWORD",
+		"byte_length":               len(plaintext),
+		"content_hash":              contentHash,
+		"algorithm":                 "AES-256-GCM",
+		"recipient_key_fingerprint": sealing.Fingerprint(recipientPub),
 		"sealed": map[string]string{
 			"algorithm":            sealing.Algorithm,
 			"ciphertext":           base64.StdEncoding.EncodeToString(ct),
@@ -109,6 +110,85 @@ func TestGetWrap_ContentHashMismatch(t *testing.T) {
 	}
 }
 
+// skills#116: a wrap sealed to another key, or with no recipient
+// fingerprint, is refused before the envelope is opened.
+func TestGetWrap_RecipientFingerprintMustBeOurs(t *testing.T) {
+	pub, priv := testKeypair(t)
+	otherPub, _ := testKeypair(t)
+	plaintext := []byte("hunter2")
+	sum := sha256.Sum256(plaintext)
+	for name, fp := range map[string]any{
+		"other key": sealing.Fingerprint(otherPub),
+		"missing":   nil,
+		"empty":     "",
+		"uppercase": strings.ToUpper(sealing.Fingerprint(pub)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := sealedWrapBody(t, plaintext, pub, hex.EncodeToString(sum[:]))
+			if fp == nil {
+				delete(body, "recipient_key_fingerprint")
+			} else {
+				body["recipient_key_fingerprint"] = fp
+			}
+			c, _ := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(body)
+			})
+			got, err := c.GetWrap(t.Context(), "a", "s", "w", pub, priv)
+			if !errors.Is(err, client.ErrWrongRecipientKey) {
+				t.Fatalf("got (%v, %v) want ErrWrongRecipientKey", got, err)
+			}
+		})
+	}
+}
+
+// Every agent-authenticated call sends X-Agent-Key-Fingerprint, and a 409
+// agent_key_mismatch maps to ErrKeyMismatch while other 409s keep their
+// meaning.
+func TestClient_KeyFingerprintHeaderAndMismatch(t *testing.T) {
+	var seen atomic.Value
+	mismatch := atomic.Bool{}
+	c, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seen.Store(r.Header.Get("X-Agent-Key-Fingerprint"))
+		if mismatch.Load() {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"agent_key_mismatch"}`))
+			return
+		}
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"request_not_approved"}`))
+	})
+	c.WithKeyFingerprint("sha256:abc")
+	pub, priv := testKeypair(t)
+	if _, err := c.GetWrap(t.Context(), "a", "s", "w", pub, priv); !errors.Is(err, client.ErrRequestNotApproved) {
+		t.Fatalf("plain 409 = %v want ErrRequestNotApproved", err)
+	}
+	if seen.Load() != "sha256:abc" {
+		t.Fatalf("X-Agent-Key-Fingerprint = %v", seen.Load())
+	}
+	mismatch.Store(true)
+	calls := map[string]func() error{
+		"heartbeat": func() error { _, err := c.Heartbeat(t.Context(), "a", "s", nil); return err },
+		"claim":     func() error { _, err := c.ClaimJob(t.Context(), "a", "s"); return err },
+		"complete":  func() error { return c.CompleteJob(t.Context(), "a", "s", "j", client.JobOutcome{Status: "failed"}) },
+		"wrap":      func() error { _, err := c.GetWrap(t.Context(), "a", "s", "w", pub, priv); return err },
+		"dek":       func() error { _, err := c.IssueDEK(t.Context(), "a", "s"); return err },
+		"post-wrap": func() error { _, err := c.PostWrap(t.Context(), "a", "s", "r", "K", []byte("x")); return err },
+		"bulk": func() error {
+			_, err := c.PostSecretsBulk(t.Context(), "a", "s", client.SecretBulkRequest{ClusterName: "c"})
+			return err
+		},
+	}
+	for name, call := range calls {
+		seen.Store("")
+		if err := call(); !errors.Is(err, client.ErrKeyMismatch) {
+			t.Errorf("%s: got %v want ErrKeyMismatch", name, err)
+		}
+		if seen.Load() != "sha256:abc" {
+			t.Errorf("%s: X-Agent-Key-Fingerprint = %v", name, seen.Load())
+		}
+	}
+}
+
 func TestGetWrap_StatusMapping(t *testing.T) {
 	cases := []struct {
 		status int
@@ -150,11 +230,12 @@ func TestGetWrap_SealedEnvelope_RoundTrip(t *testing.T) {
 	sum := sha256.Sum256(plaintext)
 	hashHex := hex.EncodeToString(sum[:])
 	body := map[string]any{
-		"wrap_id":      "w-sealed",
-		"key_name":     "DB_PASSWORD",
-		"byte_length":  len(plaintext),
-		"content_hash": hashHex,
-		"algorithm":    "AES-256-GCM",
+		"wrap_id":                   "w-sealed",
+		"key_name":                  "DB_PASSWORD",
+		"byte_length":               len(plaintext),
+		"content_hash":              hashHex,
+		"algorithm":                 "AES-256-GCM",
+		"recipient_key_fingerprint": sealing.Fingerprint(agentPub),
 		"sealed": map[string]string{
 			"algorithm":            sealing.Algorithm,
 			"ciphertext":           base64.StdEncoding.EncodeToString(envBytes),
@@ -199,14 +280,15 @@ func TestGetWrap_ValueWithKeypair_RefusesSilentDowngrade(t *testing.T) {
 	// the wire, even though the content_hash would otherwise verify.
 	plaintext := []byte("hunter2")
 	sum := sha256.Sum256(plaintext)
+	pub := make([]byte, 32)
 	body := `{"wrap_id":"w","value":"` + base64.StdEncoding.EncodeToString(plaintext) +
-		`","byte_length":7,"content_hash":"` + hex.EncodeToString(sum[:]) + `","algorithm":"AES-256-GCM"}`
+		`","byte_length":7,"content_hash":"` + hex.EncodeToString(sum[:]) + `","algorithm":"AES-256-GCM",` +
+		`"recipient_key_fingerprint":"` + sealing.Fingerprint(pub) + `"}`
 	c, _ := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(body))
 	})
-	// Non-empty keypair signals "registered"; the value branch never
-	// reaches sealing.Open, so 32-byte dummies are sufficient.
-	pub := make([]byte, 32)
+	// A non-empty key is enough here: the value branch never reaches
+	// sealing.Open, so 32-byte dummies are sufficient.
 	priv := make([]byte, 32)
 	_, err := c.GetWrap(t.Context(), "a", "s", "w", pub, priv)
 	if err == nil || !strings.Contains(err.Error(), "downgrade") {
