@@ -54,6 +54,7 @@ type common struct {
 	tlsServerName string
 	insecure      bool
 	output        string
+	allowTTY      bool
 	format        string
 	secretName    string
 	namespace     string
@@ -67,6 +68,7 @@ func (c *common) register(fs *flag.FlagSet) {
 	fs.StringVar(&c.tlsServerName, "cp-tls-server-name", os.Getenv("SB_CP_TLS_SERVER_NAME"), "override the TLS server name used to verify the control plane (also SB_CP_TLS_SERVER_NAME)")
 	fs.BoolVar(&c.insecure, "insecure-transport", envTrue("SB_INSECURE_TRANSPORT"), "allow plain http:// to the control plane (dev only; also SB_INSECURE_TRANSPORT)")
 	fs.StringVar(&c.output, "output", "", `where to write the bundle: a new file (created 0600, never overwritten) or "-" for stdout (required)`)
+	fs.BoolVar(&c.allowTTY, "allow-tty", false, `with --output -, write the bundle even when stdout is a terminal (it then stays in scrollback)`)
 	fs.StringVar(&c.format, "format", formatJSON, "bundle format: json, env or k8s-secret")
 	fs.StringVar(&c.secretName, "secret-name", defaultSecretName, "Secret name for --format k8s-secret")
 	fs.StringVar(&c.namespace, "namespace", "", "Secret namespace for --format k8s-secret (optional)")
@@ -152,7 +154,7 @@ func Enroll(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	}
 	defer token.Zero()
 
-	out, err := openOutput(c.output, stdout)
+	out, err := openOutput(c.output, stdout, c.allowTTY)
 	if err != nil {
 		return fail(stderr, err)
 	}
@@ -258,7 +260,7 @@ func RotateKey(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 	}
 	defer token.Zero()
 
-	out, err := openOutput(c.output, stdout)
+	out, err := openOutput(c.output, stdout, c.allowTTY)
 	if err != nil {
 		return fail(stderr, err)
 	}

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/secrets-bridge/agent/internal/client"
 	"github.com/secrets-bridge/agent/internal/identity"
 	"github.com/secrets-bridge/agent/internal/sealing"
 	"github.com/secrets-bridge/agent/internal/sealing/sealtest"
@@ -46,6 +48,7 @@ type fakeCP struct {
 	calls       atomic.Int32
 	sealToOther atomic.Bool // seal the challenge to a different key
 	bindOther   atomic.Bool // report a different fingerprint at enroll
+	rotateOther atomic.Bool // report a different fingerprint at rotation
 	rejectToken atomic.Bool
 
 	mu         sync.Mutex
@@ -128,8 +131,12 @@ func newFakeCP(t *testing.T) *fakeCP {
 		f.consumed[fakeRotateToken] = true
 		f.boundPub = ch.pub
 		f.mu.Unlock()
+		fp := sealing.Fingerprint(ch.pub)
+		if f.rotateOther.Load() {
+			fp = sealing.Fingerprint(bytes.Repeat([]byte{9}, 32))
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"agent_id": fakeAgentID, "public_key_fingerprint": sealing.Fingerprint(ch.pub), "public_key_version": 2,
+			"agent_id": fakeAgentID, "public_key_fingerprint": fp, "public_key_version": 2,
 		})
 	})
 	f.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -559,4 +566,119 @@ func TestEnroll_TransportFromEnv(t *testing.T) {
 		t.Fatalf("exit %d: %s", r.code, r.stderr)
 	}
 	bundleDir(t, parseJSONBundle(t, []byte(r.stdout)))
+}
+
+// A terminal on stdout is refused before the control plane is called, so
+// the one-time token is not spent and the bundle never reaches scrollback.
+// --allow-tty writes it anyway.
+func TestEnroll_StdoutTerminalRefused(t *testing.T) {
+	orig := stdoutIsTerminal
+	stdoutIsTerminal = func(io.Writer) bool { return true }
+	t.Cleanup(func() { stdoutIsTerminal = orig })
+
+	f := newFakeCP(t)
+	for _, format := range []string{formatJSON, "env", "k8s-secret"} {
+		r := runCmd(t, enroll, enrollArgs(f, "--token-file", "-", "--output", "-", "--format", format), fakeToken)
+		if r.code == 0 || !strings.Contains(r.stderr, "--allow-tty") || r.stdout != "" {
+			t.Fatalf("%s to a terminal: exit %d stdout %d bytes stderr %q", format, r.code, len(r.stdout), r.stderr)
+		}
+	}
+	if n := f.calls.Load(); n != 0 || f.isConsumed(fakeToken) {
+		t.Fatalf("refused output still called the CP %d times (token consumed: %v)", n, f.isConsumed(fakeToken))
+	}
+	r := runCmd(t, enroll, enrollArgs(f, "--token-file", "-", "--output", "-", "--allow-tty"), fakeToken)
+	if r.code != 0 {
+		t.Fatalf("--allow-tty: exit %d %q", r.code, r.stderr)
+	}
+	parseJSONBundle(t, []byte(r.stdout))
+}
+
+// rotate-key refuses a terminal the same way.
+func TestRotateKey_StdoutTerminalRefused(t *testing.T) {
+	f := newFakeCP(t)
+	r := runCmd(t, enroll, enrollArgs(f, "--token-file", tokenFile(t, fakeToken), "--output", "-"), "")
+	if r.code != 0 {
+		t.Fatalf("enroll: %s", r.stderr)
+	}
+	_, _, dir := bundleDir(t, parseJSONBundle(t, []byte(r.stdout)))
+
+	orig := stdoutIsTerminal
+	stdoutIsTerminal = func(io.Writer) bool { return true }
+	t.Cleanup(func() { stdoutIsTerminal = orig })
+	before := f.calls.Load()
+	r = runCmd(t, rotate, f.args("--credentials-dir", dir, "--rotation-token-file", "-", "--output", "-"), fakeRotateToken)
+	if r.code == 0 || !strings.Contains(r.stderr, "--allow-tty") || r.stdout != "" || f.calls.Load() != before {
+		t.Fatalf("rotate-key to a terminal: exit %d stdout %d bytes, %d CP calls, stderr %q", r.code, len(r.stdout), f.calls.Load()-before, r.stderr)
+	}
+}
+
+// The real check: a character device (a terminal, and /dev/null) is a
+// terminal, a pipe, a regular file or a buffer is not.
+func TestStdoutIsTerminal(t *testing.T) {
+	null, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Skipf("no %s: %v", os.DevNull, err)
+	}
+	defer func() { _ = null.Close() }()
+	if !stdoutIsTerminal(null) {
+		t.Fatalf("%s is a character device, want terminal", os.DevNull)
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pr.Close(); _ = pw.Close() }()
+	file, err := os.Create(filepath.Join(t.TempDir(), "out"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = file.Close() }()
+	for name, w := range map[string]io.Writer{"pipe": pw, "file": file, "buffer": &bytes.Buffer{}} {
+		if stdoutIsTerminal(w) {
+			t.Fatalf("%s reported as a terminal", name)
+		}
+	}
+}
+
+// A control plane that binds another key at rotation gets no bundle.
+func TestRotateKey_FingerprintMismatchWritesNothing(t *testing.T) {
+	f := newFakeCP(t)
+	r := runCmd(t, enroll, enrollArgs(f, "--token-file", tokenFile(t, fakeToken), "--output", "-"), "")
+	if r.code != 0 {
+		t.Fatalf("enroll: %s", r.stderr)
+	}
+	_, _, dir := bundleDir(t, parseJSONBundle(t, []byte(r.stdout)))
+	f.rotateOther.Store(true)
+	out := filepath.Join(t.TempDir(), "rotated.json")
+	r = runCmd(t, rotate, f.args("--credentials-dir", dir, "--rotation-token-file", "-", "--output", out), fakeRotateToken)
+	if r.code == 0 || !strings.Contains(r.stderr, "no bundle was written") {
+		t.Fatalf("mismatched rotation: exit %d %q", r.code, r.stderr)
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("a bundle file was left behind: %v", err)
+	}
+}
+
+// A sealed challenge that does not open to exactly 32 bytes is refused.
+func TestOpenChallenge_RefusesWrongLength(t *testing.T) {
+	kp, err := generateWireKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []int{0, 31, 33, 64} {
+		env, err := sealtest.Seal(bytes.Repeat([]byte{7}, n), kp.Public)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := openChallenge(&client.Challenge{ChallengeID: "c1", Sealed: env}, kp); err == nil {
+			t.Fatalf("a %d-byte challenge was accepted", n)
+		}
+	}
+	env, err := sealtest.Seal(bytes.Repeat([]byte{7}, 32), kp.Public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openChallenge(&client.Challenge{ChallengeID: "c1", Sealed: env}, kp); err != nil {
+		t.Fatalf("a 32-byte challenge was refused: %v", err)
+	}
 }

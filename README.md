@@ -78,6 +78,8 @@ secrets-bridge-agent enroll ... --format k8s-secret --namespace secrets-bridge -
 secrets-bridge-agent enroll ... --output ./payments-uat.json
 ```
 
+`--output -` refuses to write the bundle to a terminal, so the agent secret and private key never end up in scrollback or a screen recording. Pipe it into the secret store as above, or write a file. `--allow-tty` overrides the check when you really mean it. `/dev/null` counts as a terminal too.
+
 With the container image, pass `-i` so stdin reaches the CLI:
 
 ```bash

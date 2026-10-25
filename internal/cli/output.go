@@ -123,12 +123,28 @@ type output struct {
 	done bool
 }
 
+// stdoutIsTerminal reports whether w is a character device, which is
+// what a terminal is. Tests replace it.
+var stdoutIsTerminal = func(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
 // openOutput prepares the destination before the control plane is called,
 // so a bad path fails without spending the one-time token. A file is
 // created with O_EXCL and mode 0600: an existing file (or a symlink at the
-// path) is never overwritten.
-func openOutput(path string, stdout io.Writer) (*output, error) {
+// path) is never overwritten. "-" refuses a terminal unless allowTTY, so
+// the agent secret and private key don't land in scrollback.
+func openOutput(path string, stdout io.Writer, allowTTY bool) (*output, error) {
 	if path == "-" {
+		if !allowTTY && stdoutIsTerminal(stdout) {
+			return nil, errors.New("--output - would print the bundle, agent_secret and private_key included, to a terminal; " +
+				"pipe it into a secret store, write a file with --output <path>, or pass --allow-tty")
+		}
 		return &output{w: stdout}, nil
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
