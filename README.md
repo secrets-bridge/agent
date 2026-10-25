@@ -102,7 +102,7 @@ secrets-bridge-agent rotate-key \
   --output - < rotation-token.txt
 ```
 
-`--credentials-dir` must hold `agent_id` and `agent_secret` (owner-only modes). The CLI runs the same challenge with a new key and writes a bundle with the same agent credential and the new private key. Update the Secret and restart the agent: until then the control plane answers the old key with `409 agent_key_mismatch`, and the agent exits with a message that says so.
+`--credentials-dir` must hold `agent_id` and `agent_secret` (owner-only modes). The CLI runs the same challenge with a new key and writes a bundle with the same agent credential and the new private key. Update the Secret and restart the agent. For a Kubernetes Secret, pipe `--format k8s-secret --output -` into `kubectl apply --server-side --field-manager=secrets-bridge-agent --force-conflicts -f -`; `--force-conflicts` takes over the fields that `kubectl create secret` or another field manager set at enrollment. Until the restart, the control plane answers the old key with `409 agent_key_mismatch`, and the agent exits with a message that says so.
 
 ### Usage
 

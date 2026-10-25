@@ -231,8 +231,11 @@ func RotateKey(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 			"Generates a new X25519 wire key locally and binds it to the agent with the one-time rotation\n"+
 			"token an admin requested. The bundle keeps the same agent_id and agent_secret. Restart the\n"+
 			"agent with the new bundle; until then it gets agent_key_mismatch and exits.\n\n"+
-			"Apply --format k8s-secret with kubectl apply --server-side --field-manager=secrets-bridge-agent -f -;\n"+
-			"client-side apply copies the plaintext secret into the last-applied-configuration annotation.\n\nFlags:\n")
+			"Update a Kubernetes Secret with server-side apply only:\n"+
+			"  ... --format k8s-secret --output - | kubectl apply --server-side --field-manager=secrets-bridge-agent --force-conflicts -f -\n"+
+			"--force-conflicts takes over fields another manager (kubectl create, for one) set at enrollment.\n"+
+			"Client-side kubectl apply copies the plaintext secret into the\n"+
+			"kubectl.kubernetes.io/last-applied-configuration annotation.\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
