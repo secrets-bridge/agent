@@ -31,6 +31,18 @@ type bundle struct {
 	Fingerprint string
 }
 
+// k8sSecretHeader opens the k8s-secret manifest. Client-side kubectl apply
+// copies the whole object, stringData included, into the
+// kubectl.kubernetes.io/last-applied-configuration annotation, so the
+// plaintext agent_secret and private_key would sit outside .data, where
+// tools that treat metadata as non-sensitive can expose them. Server-side
+// apply keeps no such copy.
+const k8sSecretHeader = "# Secrets Bridge agent credentials; never commit this manifest.\n" +
+	"# Apply with: kubectl apply --server-side --field-manager=secrets-bridge-agent -f -\n" +
+	"# Do not use client-side kubectl apply (without --server-side): it stores the\n" +
+	"# plaintext agent_secret and private_key in the\n" +
+	"# kubectl.kubernetes.io/last-applied-configuration annotation.\n"
+
 // k8sName matches a DNS-1123 subdomain, the rule for Secret and namespace
 // names.
 var k8sName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`)
@@ -92,7 +104,7 @@ func (b *bundle) render(format, secretName, namespace string) ([]byte, error) {
 		if namespace != "" && !k8sName.MatchString(namespace) {
 			return nil, errors.New("--namespace is not a valid Kubernetes name")
 		}
-		out = append(out, "# Secrets Bridge agent credentials. Apply with kubectl apply -f -; never commit this manifest.\n"...)
+		out = append(out, k8sSecretHeader...)
 		out = append(out, "apiVersion: v1\nkind: Secret\nmetadata:\n  name: "...)
 		out = append(out, secretName...)
 		out = append(out, '\n')

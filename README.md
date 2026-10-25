@@ -71,12 +71,15 @@ secrets-bridge-agent enroll ... --output - | vault kv put secret/agents/payments
 secrets-bridge-agent enroll ... --format env --output - \
   | kubectl -n secrets-bridge create secret generic secrets-bridge-agent-identity --from-env-file=/dev/stdin
 
-# Kubernetes Secret manifest (apply it, never commit it)
-secrets-bridge-agent enroll ... --format k8s-secret --namespace secrets-bridge --output - | kubectl apply -f -
+# Kubernetes Secret manifest (server-side apply only, never commit it)
+secrets-bridge-agent enroll ... --format k8s-secret --namespace secrets-bridge --output - \
+  | kubectl apply --server-side --field-manager=secrets-bridge-agent -f -
 
 # A local file, created 0600 and never overwritten
 secrets-bridge-agent enroll ... --output ./payments-uat.json
 ```
+
+Always apply the `k8s-secret` manifest with `--server-side`. Client-side `kubectl apply` stores the whole manifest, including the plaintext `agent_secret` and `private_key` from `stringData`, in the `kubectl.kubernetes.io/last-applied-configuration` annotation. That copy sits outside `.data`, where tools that treat metadata as non-sensitive (metadata-only watches and listings, `kubectl describe`, logs and diffs of annotations) can expose it. Server-side apply keeps no such copy. The same holds for any `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -` pipeline: add `--server-side` to the final `kubectl apply`.
 
 `--output -` refuses to write the bundle to a terminal, so the agent secret and private key never end up in scrollback or a screen recording. Pipe it into the secret store as above, or write a file. `--allow-tty` overrides the check when you really mean it. `/dev/null` counts as a terminal too.
 
@@ -101,7 +104,7 @@ secrets-bridge-agent rotate-key \
   --output - < rotation-token.txt
 ```
 
-`--credentials-dir` must hold `agent_id` and `agent_secret` (owner-only modes). The CLI runs the same challenge with a new key and writes a bundle with the same agent credential and the new private key. Update the Secret and restart the agent: until then the control plane answers the old key with `409 agent_key_mismatch`, and the agent exits with a message that says so.
+`--credentials-dir` must hold `agent_id` and `agent_secret` (owner-only modes). The CLI runs the same challenge with a new key and writes a bundle with the same agent credential and the new private key. Update the Secret and restart the agent. For a Kubernetes Secret, pipe `--format k8s-secret --output -` into `kubectl apply --server-side --field-manager=secrets-bridge-agent --force-conflicts -f -`; `--force-conflicts` takes over the fields that `kubectl create secret` or another field manager set at enrollment. Until the restart, the control plane answers the old key with `409 agent_key_mismatch`, and the agent exits with a message that says so.
 
 ### Usage
 

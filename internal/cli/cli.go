@@ -69,7 +69,7 @@ func (c *common) register(fs *flag.FlagSet) {
 	fs.BoolVar(&c.insecure, "insecure-transport", envTrue("SB_INSECURE_TRANSPORT"), "allow plain http:// to the control plane (dev only; also SB_INSECURE_TRANSPORT)")
 	fs.StringVar(&c.output, "output", "", `where to write the bundle: a new file (created 0600, never overwritten) or "-" for stdout (required)`)
 	fs.BoolVar(&c.allowTTY, "allow-tty", false, `with --output -, write the bundle even when stdout is a terminal (it then stays in scrollback)`)
-	fs.StringVar(&c.format, "format", formatJSON, "bundle format: json, env or k8s-secret")
+	fs.StringVar(&c.format, "format", formatJSON, "bundle format: json, env or k8s-secret (apply k8s-secret with kubectl apply --server-side)")
 	fs.StringVar(&c.secretName, "secret-name", defaultSecretName, "Secret name for --format k8s-secret")
 	fs.StringVar(&c.namespace, "namespace", "", "Secret namespace for --format k8s-secret (optional)")
 }
@@ -123,7 +123,11 @@ func Enroll(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 			"Generates an X25519 wire key locally, proves possession of it to the control plane with the\n"+
 			"one-time enrollment token, and writes the credential bundle (agent_id, agent_secret,\n"+
 			"private_key, public_key_fingerprint) for your secret store. The private key never leaves\n"+
-			"this machine.\n\nFlags:\n")
+			"this machine.\n\n"+
+			"Apply --format k8s-secret with server-side apply only:\n"+
+			"  ... --format k8s-secret --output - | kubectl apply --server-side --field-manager=secrets-bridge-agent -f -\n"+
+			"Client-side kubectl apply copies the plaintext secret into the\n"+
+			"kubectl.kubernetes.io/last-applied-configuration annotation.\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -228,7 +232,12 @@ func RotateKey(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 		_, _ = fmt.Fprint(stderr, "Usage: secrets-bridge-agent rotate-key --cp-endpoint URL --credentials-dir DIR --rotation-token-file PATH|- --output PATH|- [flags]\n\n"+
 			"Generates a new X25519 wire key locally and binds it to the agent with the one-time rotation\n"+
 			"token an admin requested. The bundle keeps the same agent_id and agent_secret. Restart the\n"+
-			"agent with the new bundle; until then it gets agent_key_mismatch and exits.\n\nFlags:\n")
+			"agent with the new bundle; until then it gets agent_key_mismatch and exits.\n\n"+
+			"Update a Kubernetes Secret with server-side apply only:\n"+
+			"  ... --format k8s-secret --output - | kubectl apply --server-side --field-manager=secrets-bridge-agent --force-conflicts -f -\n"+
+			"--force-conflicts takes over fields another manager (kubectl create, for one) set at enrollment.\n"+
+			"Client-side kubectl apply copies the plaintext secret into the\n"+
+			"kubectl.kubernetes.io/last-applied-configuration annotation.\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
