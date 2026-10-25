@@ -11,189 +11,219 @@
 ---
 # secrets-bridge / agent
 
-**Outbound-only execution agent for [Secrets Bridge](https://github.com/secrets-bridge).** Runs inside a target boundary (Kubernetes cluster, private VPC, customer account) and communicates ONLY outbound to the Control Plane API + the local secrets provider. **No inbound listener on a public network interface.**
-
-## Status
-
-| Issue | Step | Status |
-|---|---|---|
-| [#1](https://github.com/secrets-bridge/agent/issues/1) | Outbound client: identity + heartbeat | ✅ merged |
-| [#2](https://github.com/secrets-bridge/agent/issues/2) | Job claim/complete loop | ✅ merged |
-| [#5](https://github.com/secrets-bridge/agent/pull/5) | `PatchExecutor` + router (Piece 4b) | ✅ merged |
-| [#6](https://github.com/secrets-bridge/agent/pull/6) | Vault resolver + `ResolverByType` (Piece 4c) | ✅ merged |
-| [#7](https://github.com/secrets-bridge/agent/pull/7) | AWS Secrets Manager resolver (Piece 4d) | ✅ merged |
-| [#8](https://github.com/secrets-bridge/agent/pull/8) | `DiscoverExecutor` + native tag preservation (Piece 6b) | ✅ merged |
-| [#9](https://github.com/secrets-bridge/agent/pull/9) | `ReadExecutor`: selective fetch + per-key wrap (Piece 5b) | ✅ merged |
-| [#10](https://github.com/secrets-bridge/agent/pull/10) | Transit security hardening (Piece 7: TLS validation + CA pinning) | ✅ merged |
-| [#11](https://github.com/secrets-bridge/agent/pull/11) | Wire-envelope encryption (Piece 8b: X25519 + KMS DEK) | ✅ merged |
-
-The agent is now feature-complete for the write + read + discover flows against both Vault and AWS Secrets Manager, with TLS validation + CA pinning + bi-directional wire-envelope crypto on top of TLS. See [`skills/PROGRESS.md`](https://github.com/secrets-bridge/skills/blob/main/PROGRESS.md) for the slice-by-slice log.
+The outbound-only execution agent for [Secrets Bridge](https://github.com/secrets-bridge). It runs inside the boundary that holds the secrets (a Kubernetes cluster, a private VPC, a customer account) and talks only outbound: to the control plane API and to the local secrets provider. It has no inbound listener on a public interface.
 
 ## Hard rules
 
-| Invariant | How enforced |
+| Invariant | How it is enforced |
 |---|---|
-| **No Postgres / Redis / any DB driver** | CI job `no-db-or-redis` greps `go.sum` for forbidden module paths and fails the build if any appear |
-| **No inbound public listener** | Local probe + metrics server binds to `127.0.0.1` only (configurable but loopback by default) |
-| **One credential, no on-disk identity state** | Pod restart re-reads the same K8s Secret; no PVC needed |
+| No Postgres, Redis or other database driver | CI job `no-db-or-redis` greps `go.sum` for forbidden module paths |
+| No inbound public listener | The probe and metrics server binds to `127.0.0.1` by default |
+| Stateless runtime: reads credentials, never writes | The runtime reads three files from a read-only directory. CI job `runtime-guards` fails the build if non-test code outside the CLI bundle writer can create, write or delete a file, or if code outside the CLI key generator generates a key |
+| Fails closed | A missing, malformed or too-open credential file stops the agent before any network call |
+| Sealed values only | Wraps are sealed to the agent's X25519 key; a plaintext value, or a wrap sealed to another key, is refused |
 
-## How it works
+## How enrollment works
 
-Two onboarding paths. **Enroll-on-first-boot (default for new agents):**
-
-```
-admin → CP:    POST /provider-connections/:id/agent-enrollment-token → { enrollment_token }   (returned once)
-admin → agent: enrollment_token (SB_ENROLLMENT_TOKEN, one-time)
-Pod first boot: no stored credential → POST /api/v1/agents/enroll
-                  → { agent_id, agent_token }  (agent_token returned once)
-                persist {agent_id, agent_token} to SB_IDENTITY_FILE (writable), then heartbeat
-Pod restart:    stored credential found → skip enrollment, heartbeat directly
-                (the one-time token is NEVER reused)
-```
-
-**Static credential (legacy / existing agents), unchanged:**
+Enrollment happens once, on the operator's side, with the same binary. The private key is generated there and never reaches the control plane or the UI.
 
 ```
-admin → CP:    POST /api/v1/agents       → { id, agent_secret }   (break-glass; see api docs)
-admin → K8s:   creates Secret with both fields
-Pod start:     reads Secret (env vars OR file) → heartbeats forever
-Pod restart:   same, reads the same Secret
+admin    -> control plane: create a one-time enrollment token for a provider connection
+operator -> local CLI:     secrets-bridge-agent enroll --token-file - ...   (token on stdin)
+CLI:       generate an X25519 key with crypto/rand
+CLI      -> control plane: POST /api/v1/agents/enroll/challenge  {public key, token}
+control plane -> CLI:      a 32-byte challenge sealed to that public key
+CLI      -> control plane: POST /api/v1/agents/enroll  {opened challenge, token}
+control plane -> CLI:      agent_id, agent_secret (once), public_key_fingerprint
+CLI:       check the fingerprint, write the bundle to a new 0600 file or stdout
+operator:  store the bundle in AWS Secrets Manager, Vault or a Kubernetes Secret
+agent pod: mounts the Secret read-only and starts
 ```
 
-**Credential resolution (precedence):** stored env vars (`SB_AGENT_ID`+`SB_AGENT_SECRET`) → populated identity file → enroll-on-first-boot (if enabled + token) → else **fail closed** (`agent credential not configured`). The enrollment token and the returned `agent_token` are never logged.
+The runtime does not enroll, write files or generate keys. A restart or reschedule reads the same Secret again. There is no PVC and no Kubernetes Secret write permission.
 
-## Configuration
+The agent credential and the wire key are separate. The credential (`agent_id` and `agent_secret`) authenticates the agent through `X-Agent-Secret`, and the control plane stores only its hash. The wire key is an X25519 key pair that the control plane seals values to; the control plane stores only the public key. The wire key is not a TLS client certificate.
 
-The agent reads its credential pair from **either** env vars **or** a mounted file. Env vars take precedence when set; this lets a chart use the cleaner env-var path for dev installations and the safer file mount for production.
+### Enroll
 
-| Env var | Flag | Default | Notes |
-|---|---|---|---|
-| `SB_CP_ENDPOINT` | `--cp-endpoint` | (required) | Control Plane API base URL |
-| `SB_AGENT_ID` | n/a | (unset) | Agent UUID (env-var bootstrap) |
-| `SB_AGENT_SECRET` | n/a | (unset) | Agent long-lived secret (env-var bootstrap) |
-| `SB_IDENTITY_FILE` | `--identity-file` | `/etc/secrets-bridge/identity.json` | JSON `{agent_id, agent_secret}` (file bootstrap) |
-| `SB_LOCAL_ADDR` | `--local-addr` | `127.0.0.1:8090` | `/healthz` `/readyz` `/metrics` |
-| `SB_HEARTBEAT_INTERVAL` | `--heartbeat-interval` | `30s` | |
-| `SB_CLAIM_INTERVAL` | `--claim-interval` | `5s` | Time between job-claim polls |
-| `SB_CLAIM_CONCURRENCY` | `--claim-concurrency` | `4` | Max in-flight jobs at once |
-| `SB_SHUTDOWN_GRACE` | `--shutdown-grace` | `15s` | |
-| `LOG_LEVEL` | n/a | `info` | `debug`/`info`/`warn`/`error` |
-| `SB_ENROLLMENT_ENABLED` | `--enrollment-enabled` | `true` | Allow enroll-on-first-boot when no credential is stored |
-| `SB_ENROLLMENT_TOKEN` | `--enrollment-token` | (unset) | One-time enrollment token; used ONLY on first boot. **Redacted from logs** |
-| `SB_AGENT_NAME` | `--agent-name` | hostname | Agent name reported at enrollment |
-| `SB_PROVIDER_TYPE` | `--provider-type` | `aws-sm` | Provider type reported at enrollment (must match the token's binding) |
-| `SB_CLUSTER_NAME` | `--cluster-name` | (unset) | Cluster identity; also reported at enrollment |
-| `SB_REGION` | `--region` | (unset) | Region reported at enrollment |
-
-**Credential precedence:** `SB_AGENT_ID`+`SB_AGENT_SECRET` (env) → populated `SB_IDENTITY_FILE` → enroll-on-first-boot (`SB_ENROLLMENT_ENABLED=true` + `SB_ENROLLMENT_TOKEN`) → else fail closed. On enrollment the agent persists the returned `{agent_id, agent_token}` to `SB_IDENTITY_FILE`, so **that path must be a writable, restart-persistent volume** (a PVC or writable mount), not a read-only Secret. The CP's `heartbeat_interval_seconds` / `job_poll_interval_seconds` (enroll response) and per-beat `next_heartbeat_seconds` (heartbeat response) drive the cadence unless the operator sets the intervals explicitly.
-
-## Helm patterns (for `secrets-bridge/charts`, Step 14)
-
-### Mode A: env-var (clean, easier for dev)
-
-```yaml
-env:
-  - name: SB_AGENT_ID
-    valueFrom:
-      secretKeyRef: { name: my-agent-secret, key: agent_id }
-  - name: SB_AGENT_SECRET
-    valueFrom:
-      secretKeyRef: { name: my-agent-secret, key: agent_secret }
+```bash
+# The token comes from the UI or the API. Read it from a file or stdin, never from argv.
+secrets-bridge-agent enroll \
+  --cp-endpoint https://sb.example.com \
+  --token-file - \
+  --name payments-uat \
+  --cluster-name tenant-a-uat \
+  --provider-type aws-sm \
+  --region eu-west-1 \
+  --output - \
+  < token.txt \
+  | aws secretsmanager put-secret-value --secret-id agents/payments-uat \
+      --secret-string file:///dev/stdin
 ```
 
-### Mode B: mounted file (K8s docs recommend for credentials)
+Other destinations:
+
+```bash
+# Vault KV (JSON on stdin)
+secrets-bridge-agent enroll ... --output - | vault kv put secret/agents/payments-uat -
+
+# Kubernetes Secret, straight from an env file on stdin
+secrets-bridge-agent enroll ... --format env --output - \
+  | kubectl -n secrets-bridge create secret generic secrets-bridge-agent --from-env-file=/dev/stdin
+
+# Kubernetes Secret manifest (apply it, never commit it)
+secrets-bridge-agent enroll ... --format k8s-secret --namespace secrets-bridge --output - | kubectl apply -f -
+
+# A local file, created 0600 and never overwritten
+secrets-bridge-agent enroll ... --output ./payments-uat.json
+```
+
+With the container image, pass `-i` so stdin reaches the CLI:
+
+```bash
+docker run -i --rm ghcr.io/secrets-bridge/agent:dev enroll --cp-endpoint https://sb.example.com \
+  --token-file - --name payments-uat --provider-type aws-sm --output - < token.txt
+```
+
+The bundle has four fields: `agent_id`, `agent_secret`, `private_key` (base64) and `public_key_fingerprint`. Formats are `json` (default), `env` and `k8s-secret`. The CLI prints only the agent_id and the fingerprint to stderr. If the output file already exists, or the path is a symlink, the CLI stops before it calls the control plane, so the token is not spent.
+
+### Rotate the wire key
+
+An admin requests a one-time rotation token (`POST /api/v1/admin/agents/:id/key-rotation`). The operator then runs:
+
+```bash
+secrets-bridge-agent rotate-key \
+  --cp-endpoint https://sb.example.com \
+  --credentials-dir ./current-credentials \
+  --rotation-token-file - \
+  --output - < rotation-token.txt
+```
+
+`--credentials-dir` must hold `agent_id` and `agent_secret` (owner-only modes). The CLI runs the same challenge with a new key and writes a bundle with the same agent credential and the new private key. Update the Secret and restart the agent: until then the control plane answers the old key with `409 agent_key_mismatch`, and the agent exits with a message that says so.
+
+### Usage
+
+```
+Usage:
+  secrets-bridge-agent                 run the agent (reads SB_AGENT_CREDENTIALS_DIR)
+  secrets-bridge-agent enroll [flags]  enroll a new agent with a one-time token
+  secrets-bridge-agent rotate-key [flags]
+                                       replace the agent's wire key with a rotation token
+```
+
+`secrets-bridge-agent enroll -h` and `secrets-bridge-agent rotate-key -h` list the flags. The transport flags (`--cp-endpoint`, `--cp-ca-file`, `--cp-tls-server-name`, `--insecure-transport`) default from the same env vars as the runtime.
+
+## Runtime
+
+### Credentials
+
+The agent reads only `SB_AGENT_CREDENTIALS_DIR` (default `/etc/secrets-bridge/agent`):
+
+| File | Content |
+|---|---|
+| `agent_id` | the agent UUID |
+| `agent_secret` | 32 bytes, base64url |
+| `private_key` | the X25519 private key, 32 bytes, base64 |
+
+Every file must be present and well-formed. A file with a group write or execute bit, or any bit for others (`mode & 0o037`), is refused. Group read is allowed because a non-root pod reads a Secret volume through `fsGroup`, which the kubelet mounts as `0440`. The check runs on the file a path resolves to, so the `..data` symlinks of a Secret volume work.
+
+At start the agent derives the public key and its fingerprint (`sha256:` plus the hex SHA-256 of the public key) and sends `X-Agent-Key-Fingerprint` on every control plane request. A `401` (revoked credential) or a `409 agent_key_mismatch` (rotated key, or the wrong Secret) stops the agent with exit code 1. Kubernetes then restarts it with its usual backoff.
+
+There are no credential env vars. `SB_AGENT_ID`, `SB_AGENT_SECRET`, `SB_AGENT_PRIVATE_KEY[_FILE]`, `SB_ENROLLMENT_*` and `SB_IDENTITY_FILE` were removed and are ignored.
+
+### Kubernetes
+
+The chart mounts one Secret with the keys `agent_id`, `agent_secret` and `private_key` (`identity.existingSecret`):
 
 ```yaml
 volumes:
-  - name: identity
+  - name: credentials
     secret:
-      secretName: my-agent-secret
-      items:
-        - { key: identity.json, path: identity.json }
+      secretName: secrets-bridge-agent
       defaultMode: 0400
 volumeMounts:
-  - { name: identity, mountPath: /etc/secrets-bridge, readOnly: true }
+  - { name: credentials, mountPath: /etc/secrets-bridge/agent, readOnly: true }
 ```
 
-Both modes use the same K8s Secret. **No PVC** is needed in either case.
+The Secret can come from `kubectl` as above, or from External Secrets Operator reading AWS Secrets Manager or Vault. See [secrets-bridge/charts](https://github.com/secrets-bridge/charts) for the values.
 
-### Mode C: enroll-on-first-boot (self-enrollment; needs a writable identity volume)
+### Configuration
 
-The chart should surface these values (wiring lives in `secrets-bridge/charts`):
+| Env var | Flag | Default | Notes |
+|---|---|---|---|
+| `SB_CP_ENDPOINT` | `--cp-endpoint` | (required) | Control plane base URL, `https://` |
+| `SB_AGENT_CREDENTIALS_DIR` | `--credentials-dir` | `/etc/secrets-bridge/agent` | Read-only credentials directory |
+| `SB_CP_CA_FILE` | `--cp-ca-file` | (system roots) | PEM CA bundle; replaces the system roots when set |
+| `SB_CP_TLS_SERVER_NAME` | `--cp-tls-server-name` | (from URL) | TLS server name override |
+| `SB_INSECURE_TRANSPORT` | `--insecure-transport` | `false` | Allow `http://` to the control plane. Dev only |
+| `SB_CLUSTER_NAME` | `--cluster-name` | (unset) | Stamped on discovered secrets; required for discover jobs |
+| `SB_LOCAL_ADDR` | `--local-addr` | `127.0.0.1:8090` | `/healthz`, `/readyz`, `/metrics` |
+| `SB_HEARTBEAT_INTERVAL` | `--heartbeat-interval` | `30s` | Used when the control plane suggests no cadence |
+| `SB_CLAIM_INTERVAL` | `--claim-interval` | `5s` | Time between job claims |
+| `SB_CLAIM_CONCURRENCY` | `--claim-concurrency` | `4` | Max jobs in flight |
+| `SB_SHUTDOWN_GRACE` | `--shutdown-grace` | `15s` | |
+| `LOG_LEVEL` | | `info` | `debug`, `info`, `warn`, `error` |
 
-```yaml
-controlPlane:
-  url: https://sb.example.com          # → SB_CP_ENDPOINT
-enrollment:
-  enabled: true                        # → SB_ENROLLMENT_ENABLED
-  token: ""                            # → SB_ENROLLMENT_TOKEN (one-time; from the CP, injected via Secret)
-agent:
-  name: ""                             # → SB_AGENT_NAME (defaults to the pod hostname)
-  clusterName: ""                      # → SB_CLUSTER_NAME
-  providerType: "aws-sm"               # → SB_PROVIDER_TYPE (must match the token's binding)
-  region: ""                           # → SB_REGION
-credential:
-  # The agent persists {agent_id, agent_token} here after enrollment so a
-  # restart reuses it instead of spending a second token. MUST be writable
-  # and survive restarts (a small PVC, or a writable emptyDir if
-  # re-enrollment on reschedule is acceptable). → SB_IDENTITY_FILE
-  persistPath: /var/lib/secrets-bridge/identity.json
-```
+Provider settings: `SB_AWS_REGION`, `SB_AWS_ENDPOINT`, `SB_AWS_ROLE_ARN`, `SB_AWS_TAG_FILTER` for AWS Secrets Manager; `SB_VAULT_ADDR`, `SB_VAULT_NAMESPACE`, `SB_VAULT_TOKEN`, `SB_VAULT_KUBERNETES_ROLE`, `SB_VAULT_KUBERNETES_MOUNT_PATH`, `SB_VAULT_KV_MOUNT`, `SB_VAULT_KV_PREFIX` for Vault. Provider credentials come from the platform (IRSA, instance role, Vault Kubernetes auth), never from a job.
 
-The enrollment token is spent exactly once: after a successful enroll the agent writes its persistent credential and, on every subsequent restart, loads that credential and skips enrollment. If the identity path is not writable/persistent the agent would re-enroll on restart and fail on the now-consumed token, so this mode requires a writable, restart-persistent volume (unlike Modes A/B).
+The heartbeat reports the job types the agent runs (`discover`, `patch`, `read`) as `capabilities`.
 
 ## Layout
 
 ```
-cmd/agent/                main + config (the binary)
+cmd/agent/              entry point: subcommand dispatch, runtime config, heartbeat and claim loops
 internal/
-  client/                 typed CP HTTP client (Heartbeat)
-  identity/               env-var-or-file credential loader
-  local/                  loopback /healthz /readyz /metrics
-  observability/          slog JSON logger
+  cli/                  enroll and rotate-key (the only code that generates a key or writes a file)
+  client/               HTTPS client to the control plane
+  executor/             read, patch and discover executors and provider resolvers
+  guard/                source guards for the runtime invariants (tests only)
+  identity/             read-only credentials directory loader
+  local/                loopback /healthz /readyz /metrics
+  observability/        JSON logger
+  sealing/              X25519 + HKDF + AES-GCM, mirror of api/pkg/sealing
+  transport/            TLS client, endpoint validation
 ```
 
-The agent imports only the stdlib + `github.com/prometheus/client_golang`. Once Step 8 (job loop) lands it will also import `github.com/secrets-bridge/core/providers` to execute provider operations.
+The agent depends on the standard library, `github.com/secrets-bridge/core/providers` (AWS Secrets Manager and Vault), Prometheus and `golang.org/x/crypto`.
 
 ## Local development
 
 ```bash
-go build ./...
-go vet ./...
+go build ./... && go vet ./...
 go test -race -count=1 ./...
+golangci-lint run
+go mod tidy   # CI fails on a diff
 ```
 
-End-to-end against a running CP:
+End to end against a local control plane:
 
 ```bash
-# 1. Bring up the CP (separate repo)
+# 1. Start the control plane (separate repo).
 ( cd ../api && docker compose up -d )
 
-# 2. Mint an agent via the CP
-MINT=$(curl -s -X POST -H 'Content-Type: application/json' \
-  -d '{"name":"demo-agent","scope":{"cluster":"prod-eu"}}' \
-  http://localhost:8080/api/v1/agents)
-AGENT_ID=$(echo "$MINT" | jq -r '.id')
-SECRET=$(echo "$MINT" | jq -r '.agent_secret')
+# 2. In the UI (or the API, with an admin session), create a provider connection
+#    and an enrollment token for it. Save the token to token.txt.
 
-# 3a. Run with env-var bootstrap
-SB_CP_ENDPOINT=http://localhost:8080 \
-SB_AGENT_ID=$AGENT_ID \
-SB_AGENT_SECRET=$SECRET \
-SB_HEARTBEAT_INTERVAL=2s \
+# 3. Enroll. The local control plane is plain http, so opt in to insecure transport.
+go run ./cmd/agent enroll --cp-endpoint http://localhost:8080 --insecure-transport \
+  --token-file - --name dev-agent --cluster-name dev --provider-type aws-sm \
+  --format env --output - < token.txt > /tmp/agent.env
+rm token.txt
+
+# 4. Lay the bundle out as the credentials directory, owner-only.
+mkdir -p /tmp/sb-agent && chmod 700 /tmp/sb-agent
+while IFS='=' read -r k v; do
+  case "$k" in agent_id|agent_secret|private_key) (umask 077; printf '%s' "$v" > "/tmp/sb-agent/$k") ;; esac
+done < /tmp/agent.env
+rm /tmp/agent.env
+
+# 5. Run the agent.
+SB_CP_ENDPOINT=http://localhost:8080 SB_INSECURE_TRANSPORT=true \
+SB_AGENT_CREDENTIALS_DIR=/tmp/sb-agent SB_CLUSTER_NAME=dev \
 go run ./cmd/agent
-
-# 3b. OR with file bootstrap
-echo "{\"agent_id\":\"$AGENT_ID\",\"agent_secret\":\"$SECRET\"}" \
-  > /tmp/identity.json
-SB_CP_ENDPOINT=http://localhost:8080 \
-SB_IDENTITY_FILE=/tmp/identity.json \
-SB_HEARTBEAT_INTERVAL=2s \
-go run ./cmd/agent
-
-# 4. Watch the agent's last_seen_at tick on the CP side
-watch -n 1 'curl -s http://localhost:8080/api/v1/agents | jq'
 ```
+
+The agent's `last_seen_at` then updates in the UI's Agents view.
 
 ## Container
 
@@ -201,4 +231,4 @@ watch -n 1 'curl -s http://localhost:8080/api/v1/agents | jq'
 docker build -t secrets-bridge-agent:dev .
 ```
 
-Multi-stage build on `golang:1.25-alpine` → `distroless/static:nonroot`. No shell, no package manager.
+Multi-stage build on `golang:1.27-alpine`, runtime `distroless/static:nonroot`: no shell, no package manager. The image's entry point is `secrets-bridge-agent`, so `docker run <image>` runs the agent and `docker run -i <image> enroll ...` runs the CLI.
