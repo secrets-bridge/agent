@@ -81,6 +81,8 @@ secrets-bridge-agent enroll ... --output ./payments-uat.json
 
 Always apply the `k8s-secret` manifest with `--server-side`. Client-side `kubectl apply` stores the whole manifest, including the plaintext `agent_secret` and `private_key` from `stringData`, in the `kubectl.kubernetes.io/last-applied-configuration` annotation. That copy sits outside `.data`, where tools that treat metadata as non-sensitive (metadata-only watches and listings, `kubectl describe`, logs and diffs of annotations) can expose it. Server-side apply keeps no such copy. The same holds for any `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -` pipeline: add `--server-side` to the final `kubectl apply`.
 
+`--output -` refuses to write the bundle to a terminal, so the agent secret and private key never end up in scrollback or a screen recording. Pipe it into the secret store as above, or write a file. `--allow-tty` overrides the check when you really mean it. `/dev/null` counts as a terminal too.
+
 With the container image, pass `-i` so stdin reaches the CLI:
 
 ```bash
